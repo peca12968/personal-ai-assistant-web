@@ -14,7 +14,7 @@ builder.Services.AddHttpClient("localBridge", client => client.Timeout = TimeSpa
     });
 var app = builder.Build();
 var runtimePath = Path.GetFullPath(app.Configuration["RuntimePath"] ?? "runtime", app.Environment.ContentRootPath);
-var readable = new HashSet<string> { "view", "status", "learning", "trash", "draft" };
+var readable = new HashSet<string> { "view", "status", "learning", "trash", "draft", "correction" };
 var writable = new HashSet<string>
 {
     "new", "ask", "retry", "confirm", "withdraw", "learn", "stop", "select",

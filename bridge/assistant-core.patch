@@ -191,10 +191,10 @@ index 78bfad433d1abe8c476e44d04bc20f8b5c167020..2bc7d0a91e2593daf9ba90debae0579a
              # A seekable stdin file avoids a blocked parent-side pipe write when the
 diff --git a/assistant/html_chat.py b/assistant/html_chat.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..0681f129119335de95acbb5920ede27186ccd2cf
+index 0000000000000000000000000000000000000000..1198a7619cf6b2d5e3f25b92b129fee70242c23f
 --- /dev/null
 +++ b/assistant/html_chat.py
-@@ -0,0 +1,460 @@
+@@ -0,0 +1,522 @@
 +"""F-drive HTML desktop client for the existing local assistant and 27B runner."""
 +import argparse
 +from contextlib import contextmanager
@@ -212,11 +212,12 @@ index 0000000000000000000000000000000000000000..0681f129119335de95acbb5920ede271
 +from urllib.parse import parse_qs, urlsplit
 +import uuid
 +
-+from . import answer_runs, chat_drafts, chat_history, learning_batches, learning_queue, qwen27_learning
-+from .engine import MAX_QUESTION_CHARS, ROOT
++from . import answer_runs, chat_drafts, chat_history, learning_batches, learning_queue, local_models, qwen27_learning
++from .engine import EngineError, MAX_QUESTION_CHARS, ROOT
++from .local_engine import LocalEngine
 +from .local_models import read_json
 +from .owned_process import windows_process
-+from .qwen27_engine import Qwen27Engine
++from .qwen27_engine import CONTEXT, REPLY_TOKENS, ALIAS, Qwen27Engine
 +from .store import Store
 +from scripts.daily_delivery import DailyLocalEngine
 +from scripts.daily_expenses import DailyAssistant
@@ -229,6 +230,27 @@ index 0000000000000000000000000000000000000000..0681f129119335de95acbb5920ede271
 +MAX_BODY = 128 * 1024
 +MAX_DRAFT_BODY = 6 * chat_drafts.MAX_CHARS + 256
 +HISTORY_PAGE_SIZE = 100
++NON_MODEL_REPLIES = {'local_memory', 'local_calculation', 'local_document_calculation', 'local_transcription', 'local_evidence'}
++MODEL_4B = 'qwen3-4b-bf16'
++MODEL_OPTIONS = {
++    ALIAS: {'label': 'Qwen3.8-27B BF16', 'context_tokens': CONTEXT,
++            'input_tokens': CONTEXT - REPLY_TOKENS - 4, 'output_tokens': REPLY_TOKENS},
++    MODEL_4B: {'label': 'Qwen3-4B BF16', 'context_tokens': None,
++               'input_tokens': local_models.MAX_INPUT_TOKENS, 'output_tokens': local_models.MAX_OUTPUT_TOKENS},
++}
++
++
++class CorrectionConflict(ValueError):
++    pass
++
++
++def correction_question(payload):
++    context = json.loads(payload) if payload else {}
++    if isinstance(context, dict) and not context.get('image_inputs') and context.get('response_mode') not in NON_MODEL_REPLIES:
++        question = context.get('current_request')
++        if isinstance(question, str) and question.strip():
++            return question
++    return None
 +
 +
 +class ChatApp:
@@ -246,15 +268,30 @@ index 0000000000000000000000000000000000000000..0681f129119335de95acbb5920ede271
 +        self.warning = ''
 +        try:
 +            choice = read_json(self.choice) if self.choice.is_file() else {}
-+            self.set_engine(choice.get('batch'))
-+        except (ValueError, OSError, KeyError, TypeError, sqlite3.Error):
-+            self.set_engine(None)
-+            self.warning = '已保存的適配器目前無法核對，這個視窗使用 BF16 底座。'
++            self.set_engine(choice.get('model', ALIAS), choice.get('batch'))
++        except (ValueError, OSError, KeyError, TypeError, AttributeError, RuntimeError, sqlite3.Error):
++            self.set_engine(ALIAS)
++            self.warning = '無法核對已保存的模型，先選用 27B BF16 底座。'
 +
-+    def set_engine(self, batch):
-+        engine = Qwen27Engine(self.store.path.parent, batch=batch)
++    def set_engine(self, model, batch=None, *, persist=False):
++        if model == ALIAS:
++            engine = Qwen27Engine(self.store.path.parent, batch=batch)
++        elif model == MODEL_4B and batch is None:
++            engine = LocalEngine(self.store.path.parent, recover_chat_budget=True, web_owned=True)
++            if not engine.python.is_file():
++                raise EngineError('F 槽的 Qwen3-4B 執行環境尚未就緒。', 'local_environment')
++        else:
++            raise ValueError('請選擇此電腦支援的模型版本。')
++        if persist:
++            self.choice.parent.mkdir(parents=True, exist_ok=True)
++            learning_batches.save(self.choice, {'model': model, 'batch': batch})
++        self.model = model
++        self.batch = batch
 +        self.engine = engine
 +        self.driver = DailyAssistant(self.store, DailyLocalEngine(engine))
++
++    def model_state(self):
++        return {'id': self.model, 'batch': self.batch}
 +
 +    def view(self, sid, *, before=None):
 +        if before is not None:
@@ -280,7 +317,8 @@ index 0000000000000000000000000000000000000000..0681f129119335de95acbb5920ede271
 +        with self.guard:
 +            return {**page, 'title': session['title'], 'model': self.engine.display_name,
 +                    'sessions': [{key: row[key] for key in ('id', 'title')} for row in rows],
-+                    'can_retry': can_retry, 'warning': self.warning, 'mode': self.mode}
++                    'can_retry': can_retry, 'warning': self.warning, 'mode': self.mode,
++                    'models': MODEL_OPTIONS, 'selection': self.model_state()}
 +
 +    def history_page(self, sid, *, before=None):
 +        with self.store.connect() as db:
@@ -299,15 +337,9 @@ index 0000000000000000000000000000000000000000..0681f129119335de95acbb5920ede271
 +            messages = []
 +            for row in reversed(recent[:HISTORY_PAGE_SIZE]):
 +                message = {key: row[key] for key in ('id', 'role', 'content')}
-+                if row['role'] == 'assistant' and row['payload']:
-+                    context = json.loads(row['payload']) or {}
-+                    question = context.get('current_request')
-+                    mode = context.get('response_mode')
-+                    if (isinstance(question, str) and not context.get('image_inputs')
-+                            and mode not in {'local_memory', 'local_calculation', 'local_document_calculation',
-+                                             'local_transcription', 'local_evidence'}):
-+                        message.update(correctable=True, question=question[:2000],
-+                                       correction=row['correction'] or '')
++                question = correction_question(row['payload']) if row['role'] == 'assistant' else None
++                if question is not None:
++                    message.update(correctable=True, question=question[:2000], correction=row['correction'] or '')
 +                messages.append(message)
 +            draft = chat_drafts.read(db, sid) if before is None else None
 +        cursor = str(messages[0]['id']) if len(recent) > HISTORY_PAGE_SIZE else None
@@ -352,10 +384,10 @@ index 0000000000000000000000000000000000000000..0681f129119335de95acbb5920ede271
 +                try:
 +                    with task.activate():
 +                        result = action(task.cancel, progress)
-+                    stage = result['status'] if kind == 'learning' else 'done'
++                    stage = result['status'] if kind == 'learning' else ('cancelled' if task.cancel.is_set() else 'done')
 +                    error = result.get('error') if kind == 'learning' else None
 +                except (ValueError, OSError, RuntimeError, KeyError, TypeError, sqlite3.Error) as exc:
-+                    stage = 'cancelled' if self.cancel.is_set() else 'failed'
++                    stage = 'cancelled' if task.cancel.is_set() else 'failed'
 +                    error = str(exc)[:4000]
 +                finally:
 +                    committed = None
@@ -377,28 +409,51 @@ index 0000000000000000000000000000000000000000..0681f129119335de95acbb5920ede271
 +                raise
 +            return dict(job)
 +
++    def correction(self, sid, message_id):
++        with self.store.connect() as db:
++            db.execute('BEGIN')
++            return self.correction_snapshot(db, sid, message_id)[0]
++
++    def correction_snapshot(self, db, sid, message_id):
++        chat_history.session_id(sid)
++        if type(message_id) is not int or not 1 <= message_id < 2**63:
++            raise ValueError('回答編號無效。')
++        chat_history.assert_active(db, sid)
++        row = db.execute('''SELECT m.content, c.payload, f.rating, f.correction, f.updated_at, v.revision
++                FROM messages m LEFT JOIN answer_contexts c ON c.message_id=m.id
++                LEFT JOIN feedback f ON f.message_id=m.id LEFT JOIN feedback_versions v ON v.message_id=m.id
++                WHERE m.id=? AND m.session_id=? AND m.role='assistant' ''', (message_id, sid)).fetchone()
++        question = correction_question(row['payload']) if row is not None else None
++        if question is None:
++            raise ValueError('請選擇有原問題快照的助理文字回答。')
++        matching = []
++        for raw in db.execute(learning_queue.LATEST + " WHERE q.source_json<>'null'"):
++            entry = learning_queue.decode(raw)
++            if entry['source']['message_id'] == message_id:
++                matching.append(entry)
++        if len(matching) > 1:
++            raise ValueError('這則回覆有多個學習例子，請先從學習佇列核對。')
++        entry = matching[0] if matching else None
++        version = learning_queue.digest({'sid': sid, 'message_id': message_id, 'reply': dict(row),
++                                         'example': entry['fingerprint'] if entry else None})
++        state = learning_queue.observed(self.store, db, entry)['readiness'] if entry else 'new'
++        saved_answer = row['correction'] if row['rating'] == -1 else ''
++        if entry and state != 'needs_review':
++            question, saved_answer = entry['prompt'], entry['answer']
++        return {'version': version, 'state': state, 'prompt': question[:2000], 'answer': saved_answer or ''}, entry
++
 +    def confirm(self, body):
 +        message_id, sid = body['message_id'], body['sid']
 +        prompt = learning_queue.text(body['prompt'], 2000, '可獨立理解的問題')
 +        answer = learning_queue.text(body['answer'], 2000, '完整正確答案')
-+        if type(message_id) is not int:
-+            raise ValueError('回答編號無效。')
 +        with self.store.connect() as db:
 +            db.execute('BEGIN IMMEDIATE')
-+            match = db.execute("SELECT 1 FROM messages WHERE id=? AND session_id=? AND role='assistant'",
-+                               (message_id, sid)).fetchone()
-+            if match is None:
-+                raise ValueError('請選擇目前對話的助理回答。')
-+            matching = []
-+            for raw in db.execute(learning_queue.LATEST + ' WHERE q.source_json<>\'null\''):
-+                entry = learning_queue.decode(raw)
-+                if entry['source']['message_id'] == message_id:
-+                    matching.append(entry)
-+            if len(matching) > 1:
-+                raise ValueError('這則回覆有多個學習例子，請先從學習佇列核對。')
++            snapshot, previous = self.correction_snapshot(db, sid, message_id)
++            if body.get('version') != snapshot['version']:
++                raise CorrectionConflict('更正已改版或撤回。請核對本機版本後再確認，目前輸入已保留。')
 +            self.store.rate(message_id, -1, answer, db=db)
 +            source = learning_queue.source_from_feedback(self.store, message_id, db=db)
-+            options = {'item_id': matching[0]['id'], 'expected_revision': matching[0]['revision']} if matching else {}
++            options = {'item_id': previous['id'], 'expected_revision': previous['revision']} if previous else {}
 +            entry = learning_queue.confirm(self.store, prompt, answer, source=source, db=db, **options)
 +            return {'id': entry['id'], 'revision': entry['revision']}
 +
@@ -412,7 +467,7 @@ index 0000000000000000000000000000000000000000..0681f129119335de95acbb5920ede271
 +                if item['readiness'] == 'ready':
 +                    examples.append({key: item[key] for key in ('id', 'prompt', 'revision', 'status')})
 +        return {'examples': examples, 'jobs': qwen27_learning.recent_jobs(self.store.path.parent),
-+                'active': self.engine.batch}
++                'active': self.batch}
 +
 +    def change_mode(self, requested):
 +        if not self.controlled or requested not in ('off', 'chat', 'training'):
@@ -456,21 +511,20 @@ index 0000000000000000000000000000000000000000..0681f129119335de95acbb5920ede271
 +            row = learning_queue.withdraw(self.store, body['id'], body['revision'])
 +            return {'status': row['status']}
 +        with self.guard:
-+            if self.switching or self.job.get('running'):
++            if self.switching or self.mode == 'stopping' or self.job.get('running'):
 +                raise ValueError('請等本機工作結束後再操作。')
 +            if route in ('trash', 'restore', 'purge'):
 +                return chat_history.change(self.store, body['sid'], route)
 +            if route == 'new':
 +                return {'sid': self.store.new_session()}
 +            if route == 'select':
-+                batch = body['id']
-+                candidate = Qwen27Engine(self.store.path.parent, batch=batch)
-+                self.choice.parent.mkdir(parents=True, exist_ok=True)
-+                learning_batches.save(self.choice, {'batch': batch})
-+                self.engine = candidate
-+                self.driver = DailyAssistant(self.store, DailyLocalEngine(candidate))
++                if 'model' not in body and 'id' not in body:
++                    raise ValueError('請選擇模型。')
++                if 'model' in body and body.get('id') is not None:
++                    raise ValueError('每次只能選擇一個模型版本。')
++                self.set_engine(body.get('model', ALIAS), body.get('id'), persist=True)
 +                self.warning = ''
-+                return {'model': candidate.display_name}
++                return {'model': self.engine.display_name, 'selection': self.model_state()}
 +            if route == 'learn':
 +                if not self.controlled or self.mode != 'training':
 +                    raise ValueError('請先打開訓練開關。')
@@ -480,6 +534,8 @@ index 0000000000000000000000000000000000000000..0681f129119335de95acbb5920ede271
 +            if route in ('ask', 'retry'):
 +                if not self.controlled or self.mode != 'chat':
 +                    raise ValueError('請先打開使用模型開關。')
++                if 'expected_model' in body and body['expected_model'] != self.model_state():
++                    raise ValueError('其他分頁已變更模型。請核對頁首後再送出。')
 +                sid = body['sid']
 +                self.require_session(sid)
 +                question = body.get('question')
@@ -573,15 +629,21 @@ index 0000000000000000000000000000000000000000..0681f129119335de95acbb5920ede271
 +                return self.json(state.view(arguments.get('sid', [None])[0], before=arguments.get('before', [None])[0]))
 +            if route == 'draft':
 +                return self.json(state.draft(parse_qs(url.query).get('sid', [None])[0]))
++            if route == 'correction':
++                args = parse_qs(url.query)
++                message_id = args.get('message_id', [''])[0]
++                if len(message_id) > 19 or not message_id.isascii() or not message_id.isdecimal():
++                    raise ValueError('回答編號無效。')
++                return self.json(state.correction(args.get('sid', [None])[0], int(message_id)))
 +            if route == 'status':
 +                with state.guard:
-+                    return self.json({**state.job, 'mode': state.mode})
++                    return self.json({**state.job, 'mode': state.mode, 'selection': state.model_state()})
 +            if route == 'trash':
 +                return self.json({'sessions': chat_history.trash(state.store)})
 +            if route == 'learning':
 +                return self.json(state.learning())
 +            return self.json({'error': '找不到本機頁面。'}, HTTPStatus.NOT_FOUND)
-+        except chat_drafts.DraftConflict as exc:
++        except (chat_drafts.DraftConflict, CorrectionConflict) as exc:
 +            return self.json({'error': str(exc)}, HTTPStatus.CONFLICT)
 +        except (ValueError, OSError, RuntimeError, KeyError, TypeError, sqlite3.Error) as exc:
 +            return self.json({'error': str(exc)[:4000]}, HTTPStatus.BAD_REQUEST)
@@ -730,31 +792,138 @@ index d7493f3dc1a97a0185afae16d6019af6c85ac21d..9416c8b185754d47e47a51072d75c1ce
          if item_id is not None:
              old = latest(db, item_id)
 diff --git a/assistant/local_engine.py b/assistant/local_engine.py
-index 74b637aa504ab3ff28540d4015e58db08b7af365..cb60ac05537de8c142c103753660a3685edb424b 100644
+index 74b637aa504ab3ff28540d4015e58db08b7af365..7eb88f9278a9ab09348c8fde39b73c7c6082c7bc 100644
 --- a/assistant/local_engine.py
 +++ b/assistant/local_engine.py
-@@ -12,6 +12,7 @@ from . import document_partial, local_chat_budget, local_models, learned_models
+@@ -1,4 +1,5 @@
+ """Text-only local inference in an owned, cancellable optional-environment child."""
++from contextlib import ExitStack
+ import json
+ import math
+ import os
+@@ -10,8 +11,11 @@ from pathlib import Path
+ from .engine import EngineError, CodexEngine, MAX_PROMPT_BYTES, MAX_ANSWER_BYTES, answer_directory
+ from . import document_partial, local_chat_budget, local_models, learned_models
  from .learning_batches import PhaseExit
++from .owned_process import windows_process
++from scripts.learning.runtime import model_launch_ticket, require_web_model
  
  ERRORS = {
 +    'web_power_required': '請從 IIS 包含使用模型開關的網頁送出本機工作。',
      'system_memory': 'Windows 回報記憶體／分頁檔可用額度不足（1455），本機模型未完成作答；請先釋放記憶體或檢查分頁檔設定。沒有自動重試或改送其他引擎。',
      'gpu_busy': '本機模型正在被另一個推理或學習程序使用，這次沒有送到其他引擎。',
      'model_changed': '本機模型或研究參數的檔案／驗證記錄已變更，沒有使用未核對的版本。',
+@@ -30,7 +34,7 @@ ERRORS = {
+ 
+ class LocalEngine:
+     def __init__(self, data_dir, *, experiment=None, batch=None, active=False, timeout=240,
+-                 recover_chat_budget=False):
++                 recover_chat_budget=False, web_owned=False):
+         if type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= 900:
+             raise ValueError('本機引擎逾時需為大於0且不超過900秒的有限值。')
+         if type(recover_chat_budget) is not bool:
+@@ -41,6 +45,7 @@ class LocalEngine:
+             raise EngineError(ERRORS['model_changed'], 'local_model_changed') from None
+         self.timeout = timeout
+         self.recover_chat_budget = recover_chat_budget
++        self.web_owned = web_owned
+         self.workdir = Path(data_dir).resolve()/'local-engine-workspace'
+         self.workdir.mkdir(parents=True, exist_ok=True)
+         folder = local_models.ROOT/'data/learning/runtime'
+@@ -80,6 +85,8 @@ class LocalEngine:
+         return self._answer({'schema': 'local_inference_request_v2', 'guide': guide, 'data': data}, (guide, data), cancel)[0]
+ 
+     def _answer(self, payload, texts, cancel):
++        if self.web_owned:
++            require_web_model('chat')
+         deadline = time.monotonic() + self.timeout
+         def check():
+             if cancel and cancel.is_set():
+@@ -113,14 +120,36 @@ class LocalEngine:
+                     source.write(request); source.seek(0)
+                     command = self.command(output)
+                     check()
+-                    actual=PhaseExit(output.with_suffix('.started'))
+-                    process = subprocess.Popen(command, stdin=source, stdout=subprocess.DEVNULL, stderr=stderr,
+-                        cwd=local_models.ROOT,
+-                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+-                    try:
++                    options = {'stdin': source, 'stdout': subprocess.DEVNULL, 'stderr': stderr,
++                               'cwd': local_models.ROOT}
++                    with ExitStack() as owned:
++                        actual = None
++                        if self.web_owned:
++                            proof = owned.enter_context(model_launch_ticket(folder, 'chat'))
++                            options['env'] = {**os.environ, local_models.CHAT_ADMISSION_ENV: proof}
++                            process = owned.enter_context(windows_process(command, **options))
++                        else:
++                            process = subprocess.Popen(command, **options,
++                                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
++                            actual = PhaseExit(output.with_suffix('.started'))
++                            owned.callback(actual.close)
++
++                            def finish():
++                                try:
++                                    try:
++                                        actual.observe()
++                                    finally:
++                                        CodexEngine.stop(process)
++                                        process.wait(timeout=10)
++                                    actual.wait()
++                                except (OSError, ValueError, subprocess.TimeoutExpired):
++                                    raise EngineError('已要求停止，但無法確認本機程序已結束。', 'cleanup_unconfirmed') from None
++
++                            owned.callback(finish)
+                         last_check=0
+                         while process.poll() is None:
+-                            actual.observe()
++                            if actual is not None:
++                                actual.observe()
+                             check()
+                             if time.monotonic()-last_check>=2:
+                                 verify_selection(); last_check=time.monotonic()
+@@ -175,14 +204,5 @@ class LocalEngine:
+                             return delivered, make_receipt(raw, delivered, method=document_partial.METHOD)
+                         except (ValueError, RecursionError):
+                             raise EngineError(ERRORS['document_partial_invalid'], 'local_document_partial_invalid') from None
+-                    finally:
+-                        try:
+-                            try: actual.observe()
+-                            finally:
+-                                CodexEngine.stop(process); process.wait(timeout=10)
+-                            actual.wait()
+-                        except (OSError, ValueError, subprocess.TimeoutExpired):
+-                            raise EngineError('已要求停止，但無法確認本機程序已結束。', 'cleanup_unconfirmed') from None
+-                        finally: actual.close()
+         except OSError:
+             raise EngineError('無法啟動本機引擎或讀寫推理暫存資料。', 'local_io') from None
+diff --git a/assistant/local_models.py b/assistant/local_models.py
+index 95d4b09e6405308b97343e629f215e04c9a36099..b4480ceafe994e0237a8cb118c1dcaa0bf1685c2 100644
+--- a/assistant/local_models.py
++++ b/assistant/local_models.py
+@@ -11,6 +11,7 @@ MAX_INPUT_TOKENS = 24576
+ MAX_OUTPUT_TOKENS = 512
+ MAX_REQUEST_BYTES = 4 * 1024 * 1024
+ MAX_RESULT_BYTES = 2 * 1024 * 1024 + 8192
++CHAT_ADMISSION_ENV = 'PERSONAL_ASSISTANT_CHAT_ADMISSION'
+ 
+ 
+ def read_json(path, limit=2 * 1024 * 1024):
 diff --git a/assistant/local_worker.py b/assistant/local_worker.py
-index 1daa8db46c428a0cd0951492d63209e4fc4cccbd..ae885ae167b933324a431d8fea2e680816fdcf9e 100644
+index 1daa8db46c428a0cd0951492d63209e4fc4cccbd..57882356f1a8100be50e55fe3082b96303db8469 100644
 --- a/assistant/local_worker.py
 +++ b/assistant/local_worker.py
-@@ -11,7 +11,7 @@ if __package__ in (None, ''):
+@@ -11,7 +11,8 @@ if __package__ in (None, ''):
      sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
  from assistant import local_models, learned_models
  from assistant import document_partial, local_chat_budget
 -from scripts.learning.runtime import gpu_lease
-+from scripts.learning.runtime import ModelPowerRequired, gpu_lease, require_web_model
++from scripts.learning.runtime import (ModelPowerRequired, consume_model_launch_ticket, gpu_lease,
++                                      require_web_model, web_model_task)
  from scripts.learning.protocol import EXPECTED_VERSIONS
  
  SYSTEM_GUIDANCE = (
-@@ -101,6 +101,10 @@ def validate_document_citations(answer, excerpts):
+@@ -101,6 +102,10 @@ def validate_document_citations(answer, excerpts):
  
  def infer(request):
      request_text(request)
@@ -765,6 +934,28 @@ index 1daa8db46c428a0cd0951492d63209e4fc4cccbd..ae885ae167b933324a431d8fea2e6808
      os.environ['HF_HOME'] = str(local_models.ROOT/'data/learning/huggingface')
      os.environ['HF_HUB_OFFLINE'] = '1'
      os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
+@@ -203,6 +208,7 @@ def main():
+     parser = argparse.ArgumentParser()
+     parser.add_argument('--output', type=Path, required=True)
+     args = parser.parse_args()
++    proof = os.environ.pop(local_models.CHAT_ADMISSION_ENV, '')
+     with args.output.with_suffix('.started').open('x',encoding='ascii') as marker:
+         marker.write(str(os.getpid()))
+     code = 0
+@@ -214,7 +220,12 @@ def main():
+             request = json.loads(payload.decode('utf-8'))
+         except (UnicodeError, ValueError):
+             raise Failure('invalid_request') from None
+-        result = infer(request)
++        try:
++            consume_model_launch_ticket(args.output.parent, 'chat', proof)
++        except ModelPowerRequired:
++            raise Failure('web_power_required') from None
++        with web_model_task('chat'):
++            result = infer(request)
+     except Failure as exc:
+         result = {'schema': 'local_inference_result_v1', 'status': 'failed', 'code': exc.code}
+         code = 1
 diff --git a/assistant/memory_commands.py b/assistant/memory_commands.py
 index 6bb14a94aaaf1a04091f0972b6de809299c90d50..d8b721007d313f8cd3c62d9fe8a5fef1fb1f632b 100644
 --- a/assistant/memory_commands.py
@@ -787,10 +978,10 @@ index 6bb14a94aaaf1a04091f0972b6de809299c90d50..d8b721007d313f8cd3c62d9fe8a5fef1
          consume(db, sid, question, draft, uid)
 diff --git a/assistant/owned_process.py b/assistant/owned_process.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..78eccae05ff109a48bde0aa9a2343aa6c203c99e
+index 0000000000000000000000000000000000000000..e4eb5a10dc46324b1b090f690f31e8a78de363f8
 --- /dev/null
 +++ b/assistant/owned_process.py
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,90 @@
 +"""Run a Windows subprocess in a job that closes the complete process tree."""
 +from contextlib import contextmanager
 +import ctypes as c
@@ -855,9 +1046,11 @@ index 0000000000000000000000000000000000000000..78eccae05ff109a48bde0aa9a2343aa6
 +            handle = int(process._handle)
 +            if not api.AssignProcessToJobObject(job, handle):
 +                raise c.WinError(c.get_last_error())
-+            if resume(handle) != 0:
-+                raise OSError('Windows 無法啟動已受控的本機程序。')
-+            with owned_web_process(terminate):
++            def start():
++                if resume(handle) != 0:
++                    raise OSError('Windows 無法啟動已受控的本機程序。')
++
++            with owned_web_process(terminate, start):
 +                yield process
 +        finally:
 +            try:
@@ -2019,10 +2212,10 @@ index 0000000000000000000000000000000000000000..708b4fc31bc3749e36fd5fbae10da8d7
 +    with web_model_task('training'):
 +        fit(folder)
 diff --git a/scripts/learning/runtime.py b/scripts/learning/runtime.py
-index 7b43f429b175b8c9e62936b7121a9327e18f4acf..5d95068d36a5f3bf4dcc12ed9d2c135f5edb4d65 100644
+index 7b43f429b175b8c9e62936b7121a9327e18f4acf..e35ce332171561f0cd43c9981084cc142d8094fc 100644
 --- a/scripts/learning/runtime.py
 +++ b/scripts/learning/runtime.py
-@@ -1,14 +1,112 @@
+@@ -1,14 +1,127 @@
 -"""Process-held advisory GPU lease; a leftover file never proves a live owner."""
 +"""Web-authorized model tasks and process-held advisory GPU leases."""
 +from contextvars import ContextVar
@@ -2069,9 +2262,15 @@ index 7b43f429b175b8c9e62936b7121a9327e18f4acf..5d95068d36a5f3bf4dcc12ed9d2c135f
 +
 +    def force_stop(self):
 +        self.cancel.set()
++        failure = None
 +        with self.lock:
 +            for terminate in self.terminators:
-+                terminate()
++                try:
++                    terminate()
++                except OSError as exc:
++                    failure = exc
++        if failure is not None:
++            raise failure
 +
 +
 +def web_model_task(mode, cancel=None):
@@ -2079,17 +2278,18 @@ index 7b43f429b175b8c9e62936b7121a9327e18f4acf..5d95068d36a5f3bf4dcc12ed9d2c135f
 +
 +
 +@contextmanager
-+def owned_web_process(terminate):
++def owned_web_process(terminate, start):
 +    task = _WEB_TASK.get()
 +    if task is None:
++        start()
 +        yield
 +        return
 +    with task.lock:
++        require_web_model(task.mode)
 +        task.terminators.add(terminate)
 +        try:
-+            if task.cancel.is_set():
-+                terminate()
-+        except OSError:
++            start()
++        except BaseException:
 +            task.terminators.discard(terminate)
 +            raise
 +    try:
@@ -2100,9 +2300,9 @@ index 7b43f429b175b8c9e62936b7121a9327e18f4acf..5d95068d36a5f3bf4dcc12ed9d2c135f
 +
 +
 +@contextmanager
-+def fit_launch_ticket(folder):
-+    require_web_model('training')
-+    marker = Path(folder) / 'fit-admission.json'
++def model_launch_ticket(folder, mode):
++    require_web_model(mode)
++    marker = Path(folder) / {'training': 'fit-admission.json', 'chat': 'chat-admission.json'}[mode]
 +    proof = secrets.token_hex(32)
 +    with marker.open('x', encoding='ascii') as stream:
 +        json.dump({'digest': hashlib.sha256(proof.encode('ascii')).hexdigest(),
@@ -2113,8 +2313,8 @@ index 7b43f429b175b8c9e62936b7121a9327e18f4acf..5d95068d36a5f3bf4dcc12ed9d2c135f
 +        marker.unlink(missing_ok=True)
 +
 +
-+def consume_fit_ticket(folder, proof):
-+    marker = Path(folder) / 'fit-admission.json'
++def consume_model_launch_ticket(folder, mode, proof):
++    marker = Path(folder) / {'training': 'fit-admission.json', 'chat': 'chat-admission.json'}[mode]
 +    try:
 +        if len(proof) != 64 or any(c not in '0123456789abcdef' for c in proof):
 +            raise ValueError('invalid proof')
@@ -2125,7 +2325,15 @@ index 7b43f429b175b8c9e62936b7121a9327e18f4acf..5d95068d36a5f3bf4dcc12ed9d2c135f
 +            raise ValueError('invalid ticket')
 +        marker.unlink()  # Atomic one-time consumption before loading weights.
 +    except (KeyError, OSError, ValueError, TypeError) as exc:
-+        raise ModelPowerRequired('請由網頁的訓練開關啟動這個工作。') from exc
++        raise ModelPowerRequired('請由網頁的對應開關啟動這個工作。') from exc
++
++
++def fit_launch_ticket(folder):
++    return model_launch_ticket(folder, 'training')
++
++
++def consume_fit_ticket(folder, proof):
++    consume_model_launch_ticket(folder, 'training', proof)
  
  
  @contextmanager
@@ -2139,10 +2347,10 @@ index 7b43f429b175b8c9e62936b7121a9327e18f4acf..5d95068d36a5f3bf4dcc12ed9d2c135f
      # another process may already have an open handle to the same file.
 diff --git a/tests/test_html_chat.py b/tests/test_html_chat.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..3311dbcb3ecc64892a46b1505c26b3b509f297ce
+index 0000000000000000000000000000000000000000..85a09605c77179bf3b17a2632a47d058ebea9735
 --- /dev/null
 +++ b/tests/test_html_chat.py
-@@ -0,0 +1,282 @@
+@@ -0,0 +1,410 @@
 +import json
 +import os
 +from pathlib import Path
@@ -2158,12 +2366,14 @@ index 0000000000000000000000000000000000000000..3311dbcb3ecc64892a46b1505c26b3b5
 +
 +from assistant import chat_drafts, chat_history, learning_queue, qwen27_learning
 +from assistant.engine import CodexEngine, EngineError
-+from assistant.html_chat import ChatApp, server_for
++from assistant.html_chat import ALIAS, MODEL_4B, ChatApp, server_for
++from assistant.learning_batches import PhaseExit
++from assistant.local_engine import LocalEngine
 +from assistant.owned_process import windows_process
 +from assistant.qwen27_engine import Qwen27Engine
 +from assistant.store import Store
-+from scripts.learning.runtime import (ModelPowerRequired, consume_fit_ticket, fit_launch_ticket,
-+                                      gpu_lease, require_web_model, web_model_task)
++from scripts.learning.runtime import (ModelPowerRequired, WebModelTask, consume_fit_ticket, fit_launch_ticket,
++                                      gpu_lease, owned_web_process, require_web_model, web_model_task)
 +
 +
 +class FakeQwen:
@@ -2195,17 +2405,52 @@ index 0000000000000000000000000000000000000000..3311dbcb3ecc64892a46b1505c26b3b5
 +        correction = {'sid': self.sid, 'message_id': answer_id, 'prompt': '測試卡內容？', 'answer': '乙'}
 +        with self.assertRaises(ValueError):
 +            self.app.confirm({**correction, 'sid': other})
-+        first = self.app.confirm(correction)
-+        second = self.app.confirm({**correction, 'answer': '丙'})
++        def current_version():
++            return self.app.correction(self.sid, answer_id)['version']
++
++        first = self.app.confirm({**correction, 'version': current_version()})
++        second = self.app.confirm({**correction, 'version': current_version(), 'answer': '丙'})
 +        self.assertEqual(first['id'], second['id'])
 +        self.assertEqual(second['revision'], 2)
 +        conflict = '已有人確認的另一題'
 +        learning_queue.confirm(self.store, conflict, '丁')
 +        with self.assertRaises(ValueError):
-+            self.app.confirm({**correction, 'prompt': conflict, 'answer': '戊'})
++            self.app.confirm({**correction, 'version': current_version(), 'prompt': conflict, 'answer': '戊'})
 +        current = learning_queue.get(self.store, second['id'])
 +        self.assertEqual((current['revision'], current['answer'], current['readiness']), (2, '丙', 'ready'))
 +        self.assertEqual(current['source']['correction'], '丙')
++
++    def test_web_old_correction_cannot_undo_withdrawal_or_replace_a_new_version(self):
++        answer = self.store.add_answer(self.sid, '舊回答', {'current_request': '測試用品應交給誰？'})
++        body = {'sid': self.sid, 'message_id': answer, 'prompt': '測試用品應交給誰？', 'answer': '交給甲。'}
++        with server_for(self.app) as (address, token):
++            def call(route, value=None):
++                headers = {'Authorization': 'Bearer ' + token, 'Origin': address, 'Content-Type': 'application/json'}
++                req = Request(address + '/api/' + route, data=None if value is None else
++                              json.dumps(value, ensure_ascii=False).encode('utf8'), headers=headers)
++                with urlopen(req, timeout=5) as response:
++                    return json.load(response)
++
++            path = f'correction?sid={self.sid}&message_id={answer}'
++            initial = call(path)
++            first = call('confirm', {**body, 'version': initial['version']})
++            selected = call(path)
++            call('withdraw', first)
++            with self.assertRaises(HTTPError) as stale:
++                call('confirm', {**body, 'version': selected['version']})
++            self.assertEqual(stale.exception.code, 409)
++            self.assertEqual(call('learning')['examples'], [])
++            withdrawn = call(path)
++            self.assertEqual(withdrawn['state'], 'withdrawn')
++            self.assertEqual(withdrawn['answer'], body['answer'])
++            second = call('confirm', {**body, 'version': withdrawn['version'], 'answer': '交給乙。'})
++            self.assertEqual(second['revision'], 3)
++            with self.assertRaises(HTTPError) as stale:
++                call('confirm', {**body, 'version': withdrawn['version']})
++            self.assertEqual(stale.exception.code, 409)
++            self.assertEqual(call(path)['answer'], '交給乙。')
++            self.assertEqual(call('status')['mode'], 'off')
++            self.assertEqual(call('learning')['examples'][0]['revision'], 3)
 +
 +    def test_api_requires_key_and_matching_origin(self):
 +        with server_for(self.app) as (address, token):
@@ -2288,6 +2533,40 @@ index 0000000000000000000000000000000000000000..3311dbcb3ecc64892a46b1505c26b3b5
 +        self.assertEqual(ChatApp(self.store, controlled=True).mode, 'off')
 +        self.assertEqual(app.change_mode('off'), {'mode': 'off'})
 +
++    def test_model_preference_switches_limits_without_permission_or_inference(self):
++        app = ChatApp(self.store, controlled=True)
++        app.choice.parent.mkdir(parents=True)
++        app.choice.write_text('{"batch":null}', encoding='utf-8')
++        self.assertEqual(ChatApp(self.store, controlled=True).model, ALIAS)
++        with patch('assistant.html_chat.LocalEngine') as create:
++            create.return_value.python = Path(sys.executable)
++            create.return_value.display_name = 'Qwen3-4B BF16'
++            selected = app.dispatch('select', {'model': MODEL_4B})
++            self.assertEqual(selected['selection'], {'id': MODEL_4B, 'batch': None})
++            self.assertEqual(app.mode, 'off')
++            self.assertIsNone(app.worker)
++            snapshot = app.view(self.sid)
++            self.assertEqual(snapshot['models'][MODEL_4B]['input_tokens'], 24576)
++            self.assertEqual(snapshot['models'][ALIAS]['input_tokens'], 7676)
++            self.assertEqual(snapshot['models'][ALIAS]['output_tokens'], 512)
++            restarted = ChatApp(self.store, controlled=True)
++            self.assertEqual((restarted.model, restarted.mode), (MODEL_4B, 'off'))
++            self.assertEqual(create.call_args.kwargs, {'recover_chat_budget': True, 'web_owned': True})
++            app.change_mode('chat')
++            with self.assertRaisesRegex(ValueError, '其他分頁已變更模型'):
++                app.dispatch('ask', {'sid': self.sid, 'question': '測試', 'expected_model': {'id': ALIAS, 'batch': None}})
++            app.change_mode('off')
++            create.return_value.answer.assert_not_called()
++        self.assertEqual(app.dispatch('select', {'model': ALIAS})['selection']['id'], ALIAS)
++
++    def test_stopped_web_task_cannot_resume_a_late_registered_process(self):
++        task = WebModelTask('chat')
++        task.force_stop()
++        launched = Event()
++        with task.activate(), self.assertRaises(ModelPowerRequired), owned_web_process(lambda: None, launched.set):
++            self.fail('stopped task admitted a process')
++        self.assertFalse(launched.is_set())
++
 +    def test_web_draft_is_restored_per_conversation_even_while_off(self):
 +        other = self.store.new_session('第二段')
 +        chat_drafts.save(self.store, self.sid, '  第一段尚未送出\n', 0)
@@ -2366,7 +2645,7 @@ index 0000000000000000000000000000000000000000..3311dbcb3ecc64892a46b1505c26b3b5
 +        app.start('chat', simulate)
 +        self.assertTrue(entered.wait(4))
 +        self.assertEqual(app.change_mode('off'), {'mode': 'off'})
-+        self.assertEqual(app.job['stage'], 'done')
++        self.assertEqual(app.job['stage'], 'cancelled')
 +        self.assertFalse(app.job['running'])
 +
 +    @unittest.skipUnless(os.name == 'nt', 'Windows job ownership')
@@ -2390,6 +2669,62 @@ index 0000000000000000000000000000000000000000..3311dbcb3ecc64892a46b1505c26b3b5
 +        self.assertNotEqual(observed.get('exit'), None)
 +        self.assertNotEqual(observed['exit'], 0)
 +
++    @unittest.skipUnless(os.name == 'nt', 'Windows job ownership')
++    def test_off_forces_4b_worker_and_its_child_to_exit(self):
++        app = ChatApp(self.store, controlled=True)
++        engine = LocalEngine(self.store.path.parent, web_owned=True)
++        marker = self.store.path.parent / 'grandchild.pid'
++        observer = PhaseExit(marker)
++        self.addCleanup(observer.close)
++        sleeper = ('import pathlib, subprocess, sys, time\n'
++                   'child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])\n'
++                   'pathlib.Path(sys.argv[1]).write_text(str(child.pid), encoding="ascii")\n'
++                   'time.sleep(60)\n')
++        with patch.object(engine, 'command', return_value=[sys.executable, '-c', sleeper, str(marker)]):
++            app.change_mode('chat')
++            try:
++                app.start('chat', lambda cancel, notice: engine.answer('測試程序', cancel))
++                deadline = time.monotonic() + 5
++                while observer.handle is None and time.monotonic() < deadline:
++                    observer.observe()
++                    time.sleep(.05)
++                self.assertIsNotNone(observer.handle)
++                self.assertEqual(app.change_mode('off'), {'mode': 'off'})
++                self.assertEqual(observer.api.WaitForSingleObject(observer.handle, 0), 0)
++                self.assertEqual(app.job['stage'], 'cancelled')
++            finally:
++                app.close()
++
++    @unittest.skipUnless(os.name == 'nt', 'Windows job ownership')
++    def test_4b_worker_consumes_web_admission_before_entering_inference(self):
++        app = ChatApp(self.store, controlled=True)
++        engine = LocalEngine(self.store.path.parent, web_owned=True)
++        probe = ('from assistant import local_worker\n'
++                 'from scripts.learning.runtime import require_web_model\n'
++                 'def stub(request):\n'
++                 '    require_web_model("chat")\n'
++                 '    return {"schema": "local_inference_result_v1", "status": "succeeded", '
++                 '"answer": "測試通過", "selection_fingerprint": request["selection"]["fingerprint"], '
++                 '"input_tokens": 1, "output_tokens": 1, "peak_gpu_bytes": 0}\n'
++                 'local_worker.infer = stub\n'
++                 'raise SystemExit(local_worker.main())\n')
++        def command(output):
++            return [sys.executable, '-c', probe, '--output', str(output)]
++
++        isolated = self.store.path.parent / 'unauthorized.json'
++        subprocess.run(command(isolated), input=b'{}', check=False, timeout=6)
++        self.assertEqual(json.loads(isolated.read_text())['code'], 'web_power_required')
++        observed = []
++        with patch.object(engine, 'command', side_effect=command):
++            app.change_mode('chat')
++            try:
++                app.start('chat', lambda cancel, notice: observed.append(engine.answer('測試授權', cancel)))
++                app.worker.join(timeout=8)
++                self.assertEqual(app.job['stage'], 'done')
++                self.assertEqual(observed, ['測試通過'])
++            finally:
++                app.change_mode('off')
++
 +    def test_worker_ticket_is_required_and_single_use(self):
 +        folder = self.store.path.parent
 +        with self.assertRaises(ModelPowerRequired), fit_launch_ticket(folder):
@@ -2403,7 +2738,8 @@ index 0000000000000000000000000000000000000000..3311dbcb3ecc64892a46b1505c26b3b5
 +
 +    def test_trash_restore_and_sql_purge_preserve_other_session(self):
 +        reply = self.app.driver.ask(self.sid, '請用一個字猜這張測試卡的內容。')
-+        self.app.confirm({'sid': self.sid, 'message_id': reply['id'], 'prompt': '測試卡內容？', 'answer': '乙'})
++        version = self.app.correction(self.sid, reply['id'])['version']
++        self.app.confirm({'sid': self.sid, 'message_id': reply['id'], 'prompt': '測試卡內容？', 'answer': '乙', 'version': version})
 +        other = self.store.new_session()
 +        self.store.add_message(other, 'user', '保留這一段')
 +        chat_history.change(self.store, self.sid, 'trash')

@@ -18,10 +18,16 @@
   <main>
     <header>
       <button class="menu-button" id="open-sidebar" type="button" aria-label="對話清單">☰</button>
-      <div class="conversation"><h1 id="title">新對話</h1><p id="model">Qwen3.8-27B BF16</p><p id="mode-status" role="status"></p></div>
+      <div class="conversation"><h1 id="title">新對話</h1><p id="mode-status" role="status"></p></div>
+      <div class="model-settings">
+        <label class="sr-only" for="model-select">聊天模型</label>
+        <select id="model-select" aria-describedby="model-quota" disabled><option>正在取得本機模型</option></select>
+        <p id="model-quota" aria-live="polite"></p>
+      </div>
       <div class="power" aria-label="模型運作模式">
         <label class="toggle"><input id="chat-power" type="checkbox" role="switch">使用模型</label>
         <label class="toggle"><input id="training-power" type="checkbox" role="switch">訓練</label>
+        <button id="force-off" type="button" hidden>再次強制關閉</button>
       </div>
       <button id="trash-current" type="button">移到回收筒</button>
     </header>
@@ -69,14 +75,17 @@
       <textarea id="correct-question" rows="3" maxlength="2000" required></textarea>
       <label for="correct-answer">你確認的完整正確答案</label>
       <textarea id="correct-answer" rows="5" maxlength="2000" required></textarea>
+      <details id="correction-review" hidden><summary>本機目前版本</summary><pre id="correction-saved"></pre></details>
       <p class="dialog-status" id="correction-status" role="status"></p>
-      <div class="dialog-actions"><button type="button" data-close="correction-dialog">取消</button><button class="primary" type="submit">確認並加入學習佇列</button></div>
+      <div class="dialog-actions"><button id="correction-refresh" type="button" hidden>核對本機版本</button><button type="button" data-close="correction-dialog">取消</button><button id="confirm-correction" class="primary" type="submit">確認並加入學習佇列</button></div>
     </form>
   </dialog>
   <dialog id="learning-dialog" class="learning-dialog">
     <div class="dialog-title"><h2>本機模型學習</h2><button type="button" data-close="learning-dialog" aria-label="關閉">×</button></div>
+    <p class="training-model">微調底座為 Qwen3.8-27B BF16。</p>
     <form id="learning-form">
       <fieldset><legend>已確認的例子</legend><div id="examples"></div></fieldset>
+      <button id="refresh-learning" type="button">重新整理例子</button>
       <label for="holdout-question">驗收問題（用另一種問法或未見案例）</label>
       <textarea id="holdout-question" rows="2" maxlength="2000" required></textarea>
       <label for="holdout-answer">驗收的完整答案</label>

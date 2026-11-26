@@ -8,6 +8,8 @@ if (fragment.has('key')) {
 let connected = false;
 let sid = null;
 let correctionTarget = null;
+let correctionOpening = 0;
+let learningRequest = 0;
 let viewRevision = 0;
 let viewLoading = false;
 let historyCursor = null;
@@ -19,6 +21,10 @@ let mode = 'off';
 let switching = false;
 let requestedMode = null;
 let powerRevision = 0;
+let models = {};
+let selection = null;
+let selecting = false;
+let modelRevision = 0;
 let draftBase = null;
 let draftTimer = null;
 let draftWrite = null;
@@ -62,6 +68,29 @@ function action(text, fn, css) {
 }
 function showStatus(text) { $('status').textContent = text; }
 function draftNotice(text) { $('draft-status').textContent = text; }
+function showModel(selected) {
+  const limits = models[selected?.id];
+  if (!limits || (selection?.id === selected.id && selection.batch === selected.batch)) return;
+  selection = selected;
+  const control = $('model-select');
+  const options = Object.entries(models).map(([id, model]) => {
+    const option = element('option', model.label);
+    option.value = id;
+    return option;
+  });
+  if (selected.batch) {
+    const option = element('option', limits.label + ' · LoRA ' + selected.batch.slice(0, 8));
+    option.value = 'active-lora';
+    options.push(option);
+  }
+  control.replaceChildren(...options);
+  control.value = selected.batch ? 'active-lora' : selected.id;
+  const format = value => value.toLocaleString('zh-TW');
+  const quota = [`輸入 ≤ ${format(limits.input_tokens)}`, `回覆 ≤ ${format(limits.output_tokens)}`];
+  if (limits.context_tokens) quota.unshift(`上下文 ${format(limits.context_tokens)}`);
+  $('model-quota').textContent = quota.join(' · ') + ' tokens／輪';
+  $('model-quota').title = '輸入額度含系統提示與帶入的對話。本機模型無服務商的每日訊息額度。';
+}
 function hasDraftEdit() { return draftBase && $('question').value !== draftBase.content; }
 function acknowledgeDraft(snapshot) {
   draftBase = snapshot;
@@ -111,7 +140,7 @@ async function flushDraft() {
   return true;
 }
 function busyState() {
-  const inProgress = pending || preparingDraft || switching || Boolean(job && job.running);
+  const inProgress = pending || preparingDraft || switching || selecting || Boolean(job && job.running);
   $('connect-notice').hidden = connected;
   $('send').disabled = !connected || inProgress || viewLoading || draftConflict || mode !== 'chat';
   $('retry').disabled = !connected || inProgress || viewLoading || mode !== 'chat';
@@ -126,8 +155,11 @@ function busyState() {
   const shownMode = requestedMode ?? mode;
   $('chat-power').checked = shownMode === 'chat';
   $('training-power').checked = shownMode === 'training';
-  $('chat-power').disabled = $('training-power').disabled = !connected || switching;
-  $('mode-status').textContent = !connected ? '桌面連線未就緒' : switching ? '正在切換…' :
+  $('chat-power').disabled = $('training-power').disabled = !connected || switching || mode === 'stopping';
+  $('model-select').disabled = !connected || !selection || inProgress || mode === 'stopping';
+  $('force-off').hidden = mode !== 'stopping' || switching || !connected;
+  $('mode-status').textContent = !connected ? '桌面連線未就緒' : switching ?
+    (requestedMode === 'off' ? '正在強制關閉…' : '正在切換…') :
     {off: '使用模型與訓練已關閉', chat: '使用模型已開啟 · 可送出訊息',
       training: '訓練已開啟 · 可安排微調', stopping: '正在確認模型程序退出'}[mode] || '';
   $('stop').hidden = !inProgress;
@@ -139,20 +171,39 @@ function messageNode(row, sourceSid) {
   article.append(element('div', row.role === 'user' ? '你' : '助理', 'speaker'));
   article.append(element('p', row.content));
   if (row.correctable) {
-    article.append(action('更正這則回答', () => {
-      correctionTarget = {sid: sourceSid, message_id: row.id};
-      $('correct-question').value = row.question;
-      $('correct-answer').value = row.correction || '';
-      $('correction-status').textContent = '';
-      $('correction-dialog').showModal();
-    }));
+    article.append(action('更正這則回答', () => openCorrection(sourceSid, row.id)));
   }
   return article;
+}
+function correctionState(state) {
+  return {new: '尚未確認更正', ready: '已確認', withdrawn: '已撤回', needs_review: '來源已變更'}[state] || state;
+}
+function readCorrection(target) {
+  return api('correction?' + new URLSearchParams({sid:target.sid, message_id:target.message_id}));
+}
+async function openCorrection(sourceSid, id) {
+  const opening = ++correctionOpening;
+  const target = {sid: sourceSid, message_id: id};
+  try {
+    const saved = await readCorrection(target);
+    if (opening !== correctionOpening || sid !== sourceSid || viewLoading) return;
+    correctionTarget = {...target, version:saved.version};
+    $('correct-question').value = saved.prompt;
+    $('correct-answer').value = saved.answer;
+    $('correction-status').textContent = saved.state === 'withdrawn' ?
+      '這個例子已撤回。再次確認才會加入學習佇列。' : '';
+    $('correction-review').hidden = $('correction-refresh').hidden = true;
+    $('confirm-correction').disabled = false;
+    $('correction-dialog').showModal();
+  } catch (error) {
+    if (opening === correctionOpening && sid === sourceSid) showStatus(error.message);
+  }
 }
 async function load(targetSid = sid) {
   if (preparingDraft) return;
   const revision = ++viewRevision;
   const powerAtRequest = powerRevision;
+  const modelAtRequest = modelRevision;
   viewLoading = true;
   olderLoading = false;
   busyState();
@@ -161,7 +212,7 @@ async function load(targetSid = sid) {
     const state = await api('view' + (targetSid ? '?sid=' + encodeURIComponent(targetSid) : ''));
     if (revision !== viewRevision) return;
     connected = true;
-    showView(state, powerAtRequest);
+    showView(state, powerAtRequest, modelAtRequest);
   } catch (error) {
     if (revision === viewRevision) throw error;
   } finally {
@@ -171,13 +222,14 @@ async function load(targetSid = sid) {
     }
   }
 }
-function showView(state, powerAtRequest) {
+function showView(state, powerAtRequest, modelAtRequest) {
   sid = state.sid;
   acknowledgeDraft(draftSubmission?.sid === sid ? draftSubmission.snapshot : state.draft);
   historyCursor = state.before;
   if (!switching && powerAtRequest === powerRevision) mode = state.mode;
+  models = state.models || {};
+  if (!selecting && modelAtRequest === modelRevision) showModel(state.selection);
   busyState();
-  $('model').textContent = state.model;
   if (state.warning) showStatus(state.warning);
   $('title').textContent = state.title;
   $('sessions').replaceChildren(...state.sessions.map(row => {
@@ -231,9 +283,11 @@ const stages = {
 };
 async function poll() {
   const powerAtRequest = powerRevision;
+  const modelAtRequest = modelRevision;
   try {
     job = await api('status');
     if (!switching && powerAtRequest === powerRevision) mode = job.mode;
+    if (!selecting && modelAtRequest === modelRevision) showModel(job.selection);
     const state = job.stage ? stages[job.stage] || job.stage : '';
     const finishedDraft = !viewLoading && draftSubmission && !job.running && job.id === draftSubmission.id ? draftSubmission : null;
     if (finishedDraft) {
@@ -293,12 +347,14 @@ $('chat-form').addEventListener('submit', async event => {
     return;
   }
   const sourceSid = sid;
+  const expectedModel = selection;
   preparingDraft = true;
   busyState();
   try {
     if (!(await flushDraft()) || sid !== sourceSid || viewLoading) return;
     const snapshot = draftBase;
-    const accepted = await start('ask', {sid: sourceSid, question, draft_revision: snapshot.revision});
+    const accepted = await start('ask', {sid: sourceSid, question, draft_revision: snapshot.revision,
+      expected_model: expectedModel});
     if (accepted) {
       draftSubmission = {id: accepted.id, sid: sourceSid, snapshot};
       if (sid === sourceSid) draftNotice('正在等候送出確認…');
@@ -357,7 +413,7 @@ $('question').addEventListener('keydown', event => {
     $('chat-form').requestSubmit();
   }
 });
-$('retry').addEventListener('click', () => start('retry', {sid}));
+$('retry').addEventListener('click', () => start('retry', {sid, expected_model: selection}));
 $('new-chat').addEventListener('click', async () => {
   try {
     if (!(await flushDraft())) return;
@@ -377,14 +433,41 @@ $('open-sidebar').addEventListener('click', () => $('sidebar').classList.toggle(
 document.querySelectorAll('[data-close]').forEach(button => button.addEventListener('click', () => $(button.dataset.close).close()));
 $('correction-form').addEventListener('submit', async event => {
   event.preventDefault();
+  const target = correctionTarget;
+  if (!target?.version) return;
   const button = event.submitter;
   button.disabled = true;
   try {
-    await api('confirm', {...correctionTarget, prompt: $('correct-question').value.trim(),
+    await api('confirm', {...target, prompt: $('correct-question').value.trim(),
       answer: $('correct-answer').value.trim()});
-    $('correction-dialog').close();
+    if (target === correctionTarget) $('correction-dialog').close();
     showStatus('確認更正已加入本機學習佇列。');
     await load();
+  } catch (error) {
+    if (target !== correctionTarget) return;
+    if (error.status === 409) {
+      correctionTarget.version = null;
+      $('correction-refresh').hidden = false;
+      $('correction-review').hidden = true;
+    }
+    $('correction-status').textContent = error.message;
+  } finally {
+    if (target === correctionTarget) button.disabled = !target.version;
+  }
+});
+$('correction-refresh').addEventListener('click', async () => {
+  const target = correctionTarget;
+  const button = $('correction-refresh');
+  button.disabled = true;
+  try {
+    const saved = await readCorrection(target);
+    if (target !== correctionTarget || !$('correction-dialog').open) return;
+    $('correction-saved').textContent = [correctionState(saved.state), saved.prompt, saved.answer].join('\n\n');
+    $('correction-review').hidden = false;
+    $('correction-review').open = true;
+    $('correction-status').textContent = '請比較本機版本與目前輸入。按確認才會保存目前輸入。';
+    target.version = saved.version;
+    $('confirm-correction').disabled = false;
   } catch (error) {
     $('correction-status').textContent = error.message;
   } finally {
@@ -392,8 +475,12 @@ $('correction-form').addEventListener('submit', async event => {
   }
 });
 async function learningData() {
+  const request = ++learningRequest;
   const state = await api('learning');
-  const selected = new Set([...$('examples').querySelectorAll(':checked')].map(node => node.value));
+  if (request !== learningRequest) return;
+  const selected = new Map([...$('examples').querySelectorAll(':checked')]
+    .map(node => [node.value, node.dataset.revision]));
+  let kept = 0;
   const examples = state.examples.map(row => {
     const line = element('div', undefined, 'example');
     const label = element('label', row.prompt);
@@ -401,7 +488,8 @@ async function learningData() {
     box.type = 'checkbox';
     box.value = row.id;
     box.dataset.revision = row.revision;
-    box.checked = selected.has(row.id);
+    box.checked = selected.get(row.id) === box.dataset.revision;
+    if (box.checked) kept++;
     label.prepend(box);
     label.append(element('small', '已確認 · 版本 ' + row.revision));
     line.append(label, action('撤回', async () => {
@@ -411,6 +499,7 @@ async function learningData() {
     return line;
   });
   $('examples').replaceChildren(...(examples.length ? examples : [element('p', '可在聊天回答下方確認更正。')]));
+  if (kept < selected.size) $('learning-status').textContent = '已改版或撤回的例子已取消選取。請重新核對。';
   const candidates = state.jobs.map(row => {
     const line = element('div', undefined, 'candidate');
     line.append(element('span', (stages[row.status] || row.status) + ' · ' + row.id.slice(0, 8)));
@@ -424,17 +513,42 @@ async function learningData() {
 }
 async function selectVersion(id) {
   try {
-    await api('select', {id});
-    await load();
+    if (!(await changeModel({id}))) return;
     await learningData();
     $('learning-status').textContent = '已儲存模型選擇。';
   } catch (error) { $('learning-status').textContent = error.message; }
 }
+async function changeModel(body) {
+  if (!connected || selecting || switching || pending || preparingDraft || job?.running || mode === 'stopping') return false;
+  modelRevision++;
+  selecting = true;
+  busyState();
+  try {
+    const state = await api('select', body);
+    showModel(state.selection);
+    return true;
+  } finally {
+    selecting = false;
+    modelRevision++;
+    $('model-select').value = selection?.batch ? 'active-lora' : selection?.id || '';
+    busyState();
+  }
+}
+$('model-select').addEventListener('change', async event => {
+  const selected = event.target.value;
+  if (!models[selected]) return;
+  try {
+    if (await changeModel({model: selected})) showStatus('已儲存聊天模型。');
+  } catch (error) { showStatus(error.message); }
+});
 $('learning').addEventListener('click', async () => {
   $('learning-dialog').showModal();
   try { await learningData(); }
   catch (error) { $('learning-status').textContent = error.message; }
 });
+$('refresh-learning').addEventListener('click', () => learningData().catch(error => {
+  $('learning-status').textContent = error.message;
+}));
 $('learning-form').addEventListener('submit', async event => {
   event.preventDefault();
   const selection = [...$('examples').querySelectorAll(':checked')]
@@ -452,11 +566,15 @@ async function changePower(requested) {
   switching = true;
   requestedMode = requested;
   busyState();
-  if (job?.running) showStatus('正在停止本機模型程序');
+  if (requested === 'off' || job?.running) showStatus('正在強制停止本機模型程序…');
   try {
     mode = (await api('mode', {mode: requested})).mode;
     showStatus({off: '模型與訓練已關閉', chat: '可開始本機對話', training: '可安排閒置微調'}[mode]);
   } catch (error) {
+    try {
+      const current = await api('status');
+      mode = current.mode;
+    } catch {}
     showStatus(error.message);
   } finally {
     powerRevision++;
@@ -467,6 +585,7 @@ async function changePower(requested) {
 }
 $('chat-power').addEventListener('change', event => changePower(event.target.checked ? 'chat' : 'off'));
 $('training-power').addEventListener('change', event => changePower(event.target.checked ? 'training' : 'off'));
+$('force-off').addEventListener('click', () => changePower('off'));
 $('trash-current').addEventListener('click', async () => {
   const sourceSid = sid;
   if (!sourceSid || viewLoading || !confirm('將目前對話移到回收筒？之後可以還原。')) return;
