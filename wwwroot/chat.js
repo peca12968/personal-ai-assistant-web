@@ -189,10 +189,15 @@ function timingNotes(timing) {
   if (!timing) return [];
   const seconds = milliseconds => milliseconds < 100 ? '少於 0.1 秒' :
     (milliseconds / 1000).toLocaleString('zh-TW', {maximumFractionDigits: 1}) + ' 秒';
-  return ['本輪耗時 ' + seconds(timing.total_ms), ...timing.stages.map(phase => {
+  const notes = ['本輪耗時 ' + seconds(timing.total_ms), ...timing.stages.map(phase => {
     const label = (stages[phase.stage] || phase.stage).replace(/^正在/, '');
     return label + ' · ' + seconds(phase.elapsed_ms);
   })];
+  if (timing.inference) {
+    notes.push('模型實測 · 處理輸入 ' + seconds(timing.inference.input_ms) +
+      ' · 生成回覆 ' + seconds(timing.inference.generation_ms));
+  }
+  return notes;
 }
 function messageNode(row, sourceSid, retry = null) {
   const article = element('article', undefined, 'message ' + row.role);

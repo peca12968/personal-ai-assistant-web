@@ -158,10 +158,10 @@ index dced158f5898ea16850a89dddd6452cb5cc46d99..a9cf1be2ea8ef06e8422aa52fc1634b8
 +        lines.append('被指出問題的舊回答：' + row['answer_excerpt'] + ('[…已省略…]' if row['answer_truncated'] else ''))
      return '\n\n'.join(lines)
 diff --git a/assistant/answer_runs.py b/assistant/answer_runs.py
-index 9b36a2da1ccf3b7114c4aed9dd878672792bc36d..33151808874959a2591e458db0ac2333884005fa 100644
+index 9b36a2da1ccf3b7114c4aed9dd878672792bc36d..cb40a1869934dfe1704f594954a493418e91da6a 100644
 --- a/assistant/answer_runs.py
 +++ b/assistant/answer_runs.py
-@@ -5,6 +5,37 @@ import sqlite3
+@@ -5,6 +5,42 @@ import sqlite3
  from contextlib import contextmanager
  
  
@@ -178,7 +178,8 @@ index 9b36a2da1ccf3b7114c4aed9dd878672792bc36d..33151808874959a2591e458db0ac2333
 +
 +
 +def checked_timing(value):
-+    if not isinstance(value, dict) or set(value) != {'total_ms', 'stages'}:
++    fields = {'total_ms', 'stages'}
++    if not isinstance(value, dict) or not fields <= set(value) <= fields | {'inference'}:
 +        return None
 +    from scripts.learning.runtime import CHAT_STAGES
 +
@@ -193,13 +194,17 @@ index 9b36a2da1ccf3b7114c4aed9dd878672792bc36d..33151808874959a2591e458db0ac2333
 +            return None
 +    if stages[0]['stage'] != 'queued' or sum(row['elapsed_ms'] for row in stages) != total:
 +        return None
++    inference = value.get('inference')
++    if 'inference' in value and (not isinstance(inference, dict) or set(inference) != {'input_ms', 'generation_ms'}
++            or any(type(ms) is not int or not 0 <= ms <= total for ms in inference.values())):
++        return {'total_ms': total, 'stages': stages}
 +    return value
 +
 +
  ERROR_LABELS = {
      'evidence_invalid': '本機條件核對未完成，請用相同命題名稱分別寫明規則、觀察和待判問題。',
      'transcription_invalid': '本機逐字轉錄未完成；來源、格式或輸出核對失敗，沒有保存完成答案。',
-@@ -15,6 +46,7 @@ ERROR_LABELS = {
+@@ -15,6 +51,7 @@ ERROR_LABELS = {
      'local_document_partial_invalid': '本機文件部分回答的內容或來源代號無法核對，沒有保存完成答案。',
      'calculation_invalid': '本機精確計算的算式、範圍或輸出要求不符，沒有保存完成答案；未呼叫模型。請修正算式或要求後重新提問。',
      'document_calculation_invalid': '本機文件計算的來源或算式核對失敗，沒有保存完成答案。',
@@ -207,7 +212,7 @@ index 9b36a2da1ccf3b7114c4aed9dd878672792bc36d..33151808874959a2591e458db0ac2333
      'temp_cleanup_failed': '推理暫存資料未能完全清理，沒有保存完成答案；此狀態本身不證明雲端請求已停止。',
      'timeout': '上次回答逾時，沒有保存完成答案。',
      'cancelled': '這次回答已取消，沒有保存完成答案。',
-@@ -36,6 +68,17 @@ class LeaseBusy(RuntimeError):
+@@ -36,6 +73,17 @@ class LeaseBusy(RuntimeError):
      pass
  
  
@@ -225,7 +230,7 @@ index 9b36a2da1ccf3b7114c4aed9dd878672792bc36d..33151808874959a2591e458db0ac2333
  @contextmanager
  def lease(store, run_id):
      if not isinstance(run_id, str) or not re.fullmatch(r'[0-9a-f]{32}', run_id):
-@@ -74,21 +117,45 @@ def recover(store, sid):
+@@ -74,21 +122,45 @@ def recover(store, sid):
              continue
  
  
@@ -278,7 +283,7 @@ index 9b36a2da1ccf3b7114c4aed9dd878672792bc36d..33151808874959a2591e458db0ac2333
          if db.execute("SELECT 1 FROM answer_runs WHERE session_id=? AND status='running'", (sid,)).fetchone():
              raise ValueError('目前對話已有尚未完成的回答流程，請先等候或停止。')
          if 'image_inputs' in context:
-@@ -121,13 +188,18 @@ def begin(store, sid, run_id, question, context, retry=None, draft=None):
+@@ -121,13 +193,18 @@ def begin(store, sid, run_id, question, context, retry=None, draft=None):
      return uid
  
  
@@ -298,7 +303,7 @@ index 9b36a2da1ccf3b7114c4aed9dd878672792bc36d..33151808874959a2591e458db0ac2333
          from .pending_choices import requires_history_validation, verified_output
          if requires_history_validation(context):
              from .response_delivery import check_clarification_history
-@@ -141,7 +213,12 @@ def finish(store, run_id, answer, context, checks, *, delivery=None):
+@@ -141,7 +218,12 @@ def finish(store, run_id, answer, context, checks, *, delivery=None):
                  raise ValueError('交付所需的對話已變更，沒有另存答案。')
              check_clarification_history(db, context, row['session_id'], row['user_message_id'])
          mid = db.execute("INSERT INTO messages(session_id,role,content) VALUES(?,'assistant',?)", (row['session_id'], answer)).lastrowid
@@ -312,7 +317,7 @@ index 9b36a2da1ccf3b7114c4aed9dd878672792bc36d..33151808874959a2591e458db0ac2333
          db.execute('INSERT INTO answer_checks(message_id,payload) VALUES(?,?)', (mid, json.dumps(checks, ensure_ascii=False)))
          if delivery is not None:
              from .response_delivery import save
-@@ -150,11 +227,16 @@ def finish(store, run_id, answer, context, checks, *, delivery=None):
+@@ -150,11 +232,16 @@ def finish(store, run_id, answer, context, checks, *, delivery=None):
      return mid
  
  
@@ -1840,7 +1845,7 @@ index 0000000000000000000000000000000000000000..e4eb5a10dc46324b1b090f690f31e8a7
 +        api.CloseHandle(job)
 diff --git a/assistant/qwen27_engine.py b/assistant/qwen27_engine.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..d84874b91812d6a6ba147e3707a008c887fa2ebf
+index 0000000000000000000000000000000000000000..2bc80a40799cb9241dd099d49726ba7a5feb123a
 --- /dev/null
 +++ b/assistant/qwen27_engine.py
 @@ -0,0 +1,363 @@
@@ -2085,7 +2090,7 @@ index 0000000000000000000000000000000000000000..d84874b91812d6a6ba147e3707a008c8
 +            raise EngineError('27B 回覆內容或長度無法核對。', 'invalid_response')
 +        completion_tokens = usage.get('completion_tokens')
 +        measured = completion_tokens if type(completion_tokens) is int and 1 <= completion_tokens <= max_tokens else None
-+        report_chat_usage(prompt_tokens, measured)
++        report_chat_usage(prompt_tokens, measured, timings=output.get('timings'))
 +        return answer.strip()
 +
 +
@@ -3337,10 +3342,10 @@ index 0000000000000000000000000000000000000000..708b4fc31bc3749e36fd5fbae10da8d7
 +    with web_model_task('training'):
 +        fit(folder)
 diff --git a/scripts/learning/runtime.py b/scripts/learning/runtime.py
-index 7b43f429b175b8c9e62936b7121a9327e18f4acf..c65f42afff30fcb3fd68724a6cf05f43cdd4b10c 100644
+index 7b43f429b175b8c9e62936b7121a9327e18f4acf..61bf33b3cacc13debe86da109ab1ad07dcc6a562 100644
 --- a/scripts/learning/runtime.py
 +++ b/scripts/learning/runtime.py
-@@ -1,14 +1,201 @@
+@@ -1,14 +1,217 @@
 -"""Process-held advisory GPU lease; a leftover file never proves a live owner."""
 +"""Web-authorized model tasks and process-held advisory GPU leases."""
 +from contextvars import ContextVar
@@ -3381,6 +3386,7 @@ index 7b43f429b175b8c9e62936b7121a9327e18f4acf..c65f42afff30fcb3fd68724a6cf05f43
 +        self.cancel = cancel if cancel is not None else Event()
 +        self.on_progress = on_progress
 +        self.token_usage = {'input_tokens': 0, 'output_tokens': 0, 'model_calls': 0}
++        self.inference_timing = {}
 +        self.lock = RLock()
 +        self.terminators = set()
 +        self.phase_starts = [('queued', time.monotonic())]
@@ -3448,17 +3454,32 @@ index 7b43f429b175b8c9e62936b7121a9327e18f4acf..c65f42afff30fcb3fd68724a6cf05f43
 +        if len(points) < 2:
 +            return None
 +        ended = task.stop_requested if task.stop_requested is not None else time.monotonic()
++        inference = dict(task.inference_timing) if task.inference_timing and not task.cancel.is_set() else None
 +    origin = points[0][1]
 +    offsets = [round((stamp - origin) * 1000) for _, stamp in points]
 +    total = round((ended - origin) * 1000)
 +    durations = [finish - start for start, finish in zip(offsets, offsets[1:] + [total], strict=True)]
-+    return {'total_ms': total, 'stages': [{'stage': name, 'elapsed_ms': duration}
-+                                        for (name, _), duration in zip(points, durations, strict=True)]}
++    timing = {'total_ms': total, 'stages': [{'stage': name, 'elapsed_ms': duration}
++                                          for (name, _), duration in zip(points, durations, strict=True)]}
++    if inference is not None:
++        timing['inference'] = inference
++    return timing
 +
 +
-+def report_chat_usage(input_tokens, output_tokens):
++def report_chat_usage(input_tokens, output_tokens, *, timings=None):
 +    task = _WEB_TASK.get()
-+    if task is None or task.mode != 'chat' or task.cancel.is_set() or task.token_usage is None:
++    if task is None or task.mode != 'chat' or task.cancel.is_set():
++        return
++    if task.inference_timing is not None:
++        fields = {'input_ms': 'prompt_ms', 'generation_ms': 'predicted_ms'}
++        values = {key: timings.get(source) for key, source in fields.items()} if isinstance(timings, dict) else {}
++        if len(values) != len(fields) or any(type(value) not in (int, float) or not 0 <= value < 2**53
++                                              for value in values.values()):
++            task.inference_timing = None
++        else:
++            for key, value in values.items():
++                task.inference_timing[key] = task.inference_timing.get(key, 0) + round(value)
++    if task.token_usage is None:
 +        return
 +    if type(input_tokens) is not int or type(output_tokens) is not int or min(input_tokens, output_tokens) <= 0:
 +        task.token_usage = None
@@ -3576,10 +3597,10 @@ index 0000000000000000000000000000000000000000..8549526f87a4b6d9733661156bf49c52
 +    print(verify())
 diff --git a/tests/test_html_chat.py b/tests/test_html_chat.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..8b5eabc07f98a7052ad961d6939f30d16f283082
+index 0000000000000000000000000000000000000000..7bb187eb65db122496383637f0d8beeff2b3d854
 --- /dev/null
 +++ b/tests/test_html_chat.py
-@@ -0,0 +1,1453 @@
+@@ -0,0 +1,1471 @@
 +from contextlib import contextmanager, nullcontext
 +import hashlib
 +from io import BytesIO
@@ -3609,7 +3630,7 @@ index 0000000000000000000000000000000000000000..8b5eabc07f98a7052ad961d6939f30d1
 +                                     Qwen27Engine, chat_prompt, generation_settings)
 +from assistant.store import Store
 +from scripts.learning.verify_qwen27_q8 import verify as verify_q8
-+from scripts.learning.runtime import (ModelPowerRequired, WebModelTask, chat_token_usage, consume_fit_ticket,
++from scripts.learning.runtime import (ModelPowerRequired, WebModelTask, chat_timing, chat_token_usage, consume_fit_ticket,
 +                                      fit_launch_ticket, gpu_lease, owned_web_process, report_chat_stage, report_chat_usage,
 +                                      require_web_model, web_model_task)
 +
@@ -4158,7 +4179,8 @@ index 0000000000000000000000000000000000000000..8b5eabc07f98a7052ad961d6939f30d1
 +        process = Mock()
 +        process.poll.return_value = None
 +        response = {'choices': [{'finish_reason': 'stop', 'message': {'content': '甲'}}],
-+                    'usage': {'prompt_tokens': 1341, 'completion_tokens': 7}}
++                    'usage': {'prompt_tokens': 1341, 'completion_tokens': 7},
++                    'timings': {'prompt_ms': 264.4, 'predicted_ms': 26.7}}
 +        stages = []
 +        with (
 +            patch('assistant.qwen27_engine.model_assets', return_value=(executable, weights)),
@@ -4172,6 +4194,7 @@ index 0000000000000000000000000000000000000000..8b5eabc07f98a7052ad961d6939f30d1
 +            engine = Qwen27Engine(root)
 +            self.assertEqual(engine.answer('請回答甲。'), '甲')
 +            self.assertEqual(chat_token_usage(), {'input_tokens': 1341, 'output_tokens': 7, 'model_calls': 1})
++            self.assertEqual(chat_timing()['inference'], {'input_ms': 264, 'generation_ms': 27})
 +        health.assert_called_once_with('/health', timeout=1)
 +        self.assertEqual(stages, ['chat_checking', 'chat_launch', 'chat_loading', 'chat_tokenizing', 'chat_completing'])
 +        self.assertIsNone(chat_token_usage())
@@ -4363,6 +4386,19 @@ index 0000000000000000000000000000000000000000..8b5eabc07f98a7052ad961d6939f30d1
 +        with web_model_task('training'):
 +            report_chat_usage(14, 2)
 +            self.assertIsNone(chat_token_usage())
++
++    def test_inference_timings_require_both_measures_from_each_model_call(self):
++        reading = {'prompt_ms': 52.7, 'predicted_ms': 19.3}
++        for bad in (None, {'prompt_ms': 20}, {'prompt_ms': True, 'predicted_ms': 20},
++                    {'prompt_ms': 20, 'predicted_ms': float('nan')}):
++            with self.subTest(bad=bad), web_model_task('chat'):
++                report_chat_stage('chat_completing')
++                report_chat_usage(14, 2, timings=reading)
++                report_chat_usage(19, 3, timings=reading)
++                self.assertEqual(chat_timing()['inference'], {'input_ms': 106, 'generation_ms': 38})
++                report_chat_usage(12, 2, timings=bad)
++                self.assertNotIn('inference', chat_timing())
++                self.assertEqual(chat_token_usage()['model_calls'], 3)
 +
 +    @unittest.skipUnless(os.name == 'nt', 'Windows model process ownership')
 +    def test_4b_chat_reports_worker_progress_with_separate_phase_times(self):
@@ -4665,6 +4701,7 @@ index 0000000000000000000000000000000000000000..8b5eabc07f98a7052ad961d6939f30d1
 +            stamp[0] = 109.0
 +            report_chat_stage('chat_completing')
 +            stamp[0] = 113.0
++            report_chat_usage(720, 7, timings={'prompt_ms': 3130, 'predicted_ms': 650})
 +            return '甲'
 +
 +        def cancelled(*args):
@@ -4693,7 +4730,9 @@ index 0000000000000000000000000000000000000000..8b5eabc07f98a7052ad961d6939f30d1
 +            {'stage': 'queued', 'elapsed_ms': 100}, {'stage': 'chat_context', 'elapsed_ms': 900},
 +            {'stage': 'chat_loading', 'elapsed_ms': 8000}, {'stage': 'chat_completing', 'elapsed_ms': 4000},
 +            {'stage': 'chat_finalizing', 'elapsed_ms': 0},
-+        ]})
++        ], 'inference': {'input_ms': 3130, 'generation_ms': 650}})
++        malformed = {**success, 'inference': {'input_ms': -1, 'generation_ms': 650}}
++        self.assertEqual(answer_runs.checked_timing(malformed), {k: success[k] for k in ('total_ms', 'stages')})
 +        saved = self.store.answer_context(delivered['id'])
 +        self.assertNotIn(answer_runs.TIMING_FIELD, ''.join(render_prompt_parts(saved)))
 +        retry = app.view(later)['retry']
