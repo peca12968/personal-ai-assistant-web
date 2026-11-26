@@ -24,7 +24,7 @@ index 184d57d65750e647e4aaf12bfb7bf4a42e4eda68..1d611f3b33585a1e1b5cd09fc66b1969
  exit /b 0
  :failed
 diff --git a/assistant/answer_feedback.py b/assistant/answer_feedback.py
-index dced158f5898ea16850a89dddd6452cb5cc46d99..98be890e9d821469d6ee04fd39cc1e03bb4ea884 100644
+index dced158f5898ea16850a89dddd6452cb5cc46d99..a9cf1be2ea8ef06e8422aa52fc1634b86894b714 100644
 --- a/assistant/answer_feedback.py
 +++ b/assistant/answer_feedback.py
 @@ -4,14 +4,17 @@ from . import sqlite_text
@@ -59,7 +59,7 @@ index dced158f5898ea16850a89dddd6452cb5cc46d99..98be890e9d821469d6ee04fd39cc1e03
          item = {'answer_message_id': row['id'], 'answer_created_at': row['created_at'], 'updated_at': row['updated_at']}
          item.update(update_revision=row['revision'], order_basis=row['order_basis'])
          for key, column in [('correction', 'correction'), ('answer_excerpt', 'answer')]:
-@@ -38,11 +41,47 @@ def capture(db, sid):
+@@ -38,11 +41,63 @@ def capture(db, sid):
      return {'items': items, 'selection_limited': len(rows) > MAX_ITEMS}
  
  
@@ -105,10 +105,26 @@ index dced158f5898ea16850a89dddd6452cb5cc46d99..98be890e9d821469d6ee04fd39cc1e03
 +            if entry is not None and (message_id == preferred or source_current(store, db, entry['source'])):
 +                item['confirmed_question'] = entry['prompt']
 +        return context
++
++
++def scoped_feedback_current(store, db, sid, snapshot):
++    from .learning_queue import source_current
++
++    scoped = [item for item in snapshot.get('items', ()) if 'confirmed_question' in item]
++    if not scoped:
++        return True
++    linked = linked_scopes(db, sid)
++    for item in scoped:
++        entry = linked.get(item['answer_message_id'])
++        if (entry is None or entry['prompt'] != item['confirmed_question']
++                or entry['source']['feedback_revision'] != item['update_revision']
++                or not source_current(store, db, entry['source'])):
++            return False
++    return True
  
  
  def validate(value):
-@@ -55,13 +94,20 @@ def validate(value):
+@@ -55,13 +110,20 @@ def validate(value):
      for row in value['items']:
          expected = {'answer_message_id', 'answer_created_at', 'updated_at',
                      'correction', 'answer_excerpt', 'correction_truncated', 'answer_truncated'}
@@ -130,7 +146,7 @@ index dced158f5898ea16850a89dddd6452cb5cc46d99..98be890e9d821469d6ee04fd39cc1e03
          if modern and (type(row['update_revision']) is not int or not 1 <= row['update_revision'] <= 9223372036854775807
                         or row['order_basis'] not in ('legacy_timestamp','recorded_update')):
              raise ValueError('回饋保存順序不符。')
-@@ -78,6 +124,8 @@ def describe(value):
+@@ -78,6 +140,8 @@ def describe(value):
      for row in value['items']:
          lines += [f"回答#{row['answer_message_id']} · 回饋更新：{row['updated_at']} UTC",
              ('保存順序：' + str(row['update_revision']) + ('（舊時間排序重建）' if row['order_basis']=='legacy_timestamp' else '（實際保存）')) if 'update_revision' in row else '舊快照未記錄保存順序。',
@@ -142,7 +158,7 @@ index dced158f5898ea16850a89dddd6452cb5cc46d99..98be890e9d821469d6ee04fd39cc1e03
 +        lines.append('被指出問題的舊回答：' + row['answer_excerpt'] + ('[…已省略…]' if row['answer_truncated'] else ''))
      return '\n\n'.join(lines)
 diff --git a/assistant/answer_runs.py b/assistant/answer_runs.py
-index 9b36a2da1ccf3b7114c4aed9dd878672792bc36d..3a147a5c7e202dd6dde5f26c43ce8f415fc78949 100644
+index 9b36a2da1ccf3b7114c4aed9dd878672792bc36d..33151808874959a2591e458db0ac2333884005fa 100644
 --- a/assistant/answer_runs.py
 +++ b/assistant/answer_runs.py
 @@ -5,6 +5,37 @@ import sqlite3
@@ -183,7 +199,15 @@ index 9b36a2da1ccf3b7114c4aed9dd878672792bc36d..3a147a5c7e202dd6dde5f26c43ce8f41
  ERROR_LABELS = {
      'evidence_invalid': '本機條件核對未完成，請用相同命題名稱分別寫明規則、觀察和待判問題。',
      'transcription_invalid': '本機逐字轉錄未完成；來源、格式或輸出核對失敗，沒有保存完成答案。',
-@@ -36,6 +67,10 @@ class LeaseBusy(RuntimeError):
+@@ -15,6 +46,7 @@ ERROR_LABELS = {
+     'local_document_partial_invalid': '本機文件部分回答的內容或來源代號無法核對，沒有保存完成答案。',
+     'calculation_invalid': '本機精確計算的算式、範圍或輸出要求不符，沒有保存完成答案；未呼叫模型。請修正算式或要求後重新提問。',
+     'document_calculation_invalid': '本機文件計算的來源或算式核對失敗，沒有保存完成答案。',
++    'confirmed_feedback_changed': '本輪帶入的更正已撤回或改版。重試時會讀取目前的資料。',
+     'temp_cleanup_failed': '推理暫存資料未能完全清理，沒有保存完成答案；此狀態本身不證明雲端請求已停止。',
+     'timeout': '上次回答逾時，沒有保存完成答案。',
+     'cancelled': '這次回答已取消，沒有保存完成答案。',
+@@ -36,6 +68,17 @@ class LeaseBusy(RuntimeError):
      pass
  
  
@@ -191,10 +215,17 @@ index 9b36a2da1ccf3b7114c4aed9dd878672792bc36d..3a147a5c7e202dd6dde5f26c43ce8f41
 +    pass
 +
 +
++class ConfirmedFeedbackChanged(ValueError):
++    code = 'confirmed_feedback_changed'
++
++    def __init__(self):
++        super().__init__(ERROR_LABELS[self.code])
++
++
  @contextmanager
  def lease(store, run_id):
      if not isinstance(run_id, str) or not re.fullmatch(r'[0-9a-f]{32}', run_id):
-@@ -74,21 +109,45 @@ def recover(store, sid):
+@@ -74,21 +117,45 @@ def recover(store, sid):
              continue
  
  
@@ -247,16 +278,27 @@ index 9b36a2da1ccf3b7114c4aed9dd878672792bc36d..3a147a5c7e202dd6dde5f26c43ce8f41
          if db.execute("SELECT 1 FROM answer_runs WHERE session_id=? AND status='running'", (sid,)).fetchone():
              raise ValueError('目前對話已有尚未完成的回答流程，請先等候或停止。')
          if 'image_inputs' in context:
-@@ -121,7 +180,7 @@ def begin(store, sid, run_id, question, context, retry=None, draft=None):
+@@ -121,13 +188,18 @@ def begin(store, sid, run_id, question, context, retry=None, draft=None):
      return uid
  
  
 -def finish(store, run_id, answer, context, checks, *, delivery=None):
-+def finish(store, run_id, answer, context, checks, *, delivery=None, origin=None, usage=None, timing=None):
++def finish(store, run_id, answer, context, checks, *, delivery=None, origin=None, usage=None, timing=None,
++           check_scoped_feedback=False):
      with store.connect() as db:
          db.execute('BEGIN IMMEDIATE')
          row = db.execute("SELECT session_id,user_message_id FROM answer_runs WHERE id=? AND status='running'",
-@@ -141,7 +200,12 @@ def finish(store, run_id, answer, context, checks, *, delivery=None):
+                          (run_id,)).fetchone()
+         if row is None:
+             raise ValueError('回答狀態已改變，沒有另存答案。')
++        if check_scoped_feedback:
++            from .answer_feedback import scoped_feedback_current
++            if not scoped_feedback_current(store, db, row['session_id'], context.get('answer_feedback', {})):
++                raise ConfirmedFeedbackChanged()
+         from .pending_choices import requires_history_validation, verified_output
+         if requires_history_validation(context):
+             from .response_delivery import check_clarification_history
+@@ -141,7 +213,12 @@ def finish(store, run_id, answer, context, checks, *, delivery=None):
                  raise ValueError('交付所需的對話已變更，沒有另存答案。')
              check_clarification_history(db, context, row['session_id'], row['user_message_id'])
          mid = db.execute("INSERT INTO messages(session_id,role,content) VALUES(?,'assistant',?)", (row['session_id'], answer)).lastrowid
@@ -270,7 +312,7 @@ index 9b36a2da1ccf3b7114c4aed9dd878672792bc36d..3a147a5c7e202dd6dde5f26c43ce8f41
          db.execute('INSERT INTO answer_checks(message_id,payload) VALUES(?,?)', (mid, json.dumps(checks, ensure_ascii=False)))
          if delivery is not None:
              from .response_delivery import save
-@@ -150,11 +214,16 @@ def finish(store, run_id, answer, context, checks, *, delivery=None):
+@@ -150,11 +227,16 @@ def finish(store, run_id, answer, context, checks, *, delivery=None):
      return mid
  
  
@@ -426,7 +468,7 @@ index 0000000000000000000000000000000000000000..db2b786e52eb43790257332b13475e81
 +    db.execute("UPDATE sessions SET title='已永久刪除的對話' WHERE id=?", (sid,))
 +    db.execute("UPDATE chat_history_state SET state='purged',changed_at=CURRENT_TIMESTAMP WHERE session_id=?", (sid,))
 diff --git a/assistant/engine.py b/assistant/engine.py
-index 78bfad433d1abe8c476e44d04bc20f8b5c167020..a96dfd9638c9157c10c256798bad45e17c862387 100644
+index 78bfad433d1abe8c476e44d04bc20f8b5c167020..5ef73f7fd8a34efaaa66d0377f37d124559b66fb 100644
 --- a/assistant/engine.py
 +++ b/assistant/engine.py
 @@ -29,6 +29,16 @@ ROOT = Path(__file__).resolve().parents[1]
@@ -539,7 +581,7 @@ index 78bfad433d1abe8c476e44d04bc20f8b5c167020..a96dfd9638c9157c10c256798bad45e1
                  if cancel and cancel.is_set():
                      raise EngineError('已停止這次回答。', 'cancelled')
                  from .prompt_scope import transcription_focus
-@@ -567,10 +594,21 @@ class Assistant:
+@@ -567,10 +594,23 @@ class Assistant:
                  checks = [] if evidence is not None or literal else check_citations(answer, context['documents']['excerpts'])
                  if any(not check['range_valid'] for check in checks):
                      answer += '\n\n來源檢查：有引用無法對照本次文件片段，請勿將該引用視為已驗證。'
@@ -551,6 +593,8 @@ index 78bfad433d1abe8c476e44d04bc20f8b5c167020..a96dfd9638c9157c10c256798bad45e1
 +                    completion['timing'] = chat_timing()
 +                    if origin == 'model':
 +                        completion['usage'] = chat_token_usage()
++                if origin == 'model':
++                    completion['check_scoped_feedback'] = True
 +                if delivery is not None:
 +                    completion['delivery'] = delivery
 +                mid = answer_runs.finish(self.store, run_id, answer, context, checks, **completion)
@@ -566,10 +610,10 @@ index 78bfad433d1abe8c476e44d04bc20f8b5c167020..a96dfd9638c9157c10c256798bad45e1
                  "excerpt_ids": [row["message_id"] for row in context["earlier_user_excerpts"]],
 diff --git a/assistant/html_chat.py b/assistant/html_chat.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..998699d5883c9d2d647801056585cc8974130ac2
+index 0000000000000000000000000000000000000000..0bd2c6cf5ae6ac314b62ea4a90033dfc6ad550d9
 --- /dev/null
 +++ b/assistant/html_chat.py
-@@ -0,0 +1,643 @@
+@@ -0,0 +1,645 @@
 +"""F-drive HTML desktop client for the existing local assistant and 27B runner."""
 +import argparse
 +from contextlib import contextmanager
@@ -786,6 +830,8 @@ index 0000000000000000000000000000000000000000..998699d5883c9d2d647801056585cc89
 +                try:
 +                    target = answer_runs.retry_snapshot(db, sid)
 +                    retry = {key: target[key] for key in ('id', 'user_message_id', 'status')}
++                    if target['error_code'] == answer_runs.ConfirmedFeedbackChanged.code:
++                        retry['feedback_changed'] = True
 +                    if 'timing' in target:
 +                        retry.update(timing=target['timing'],
 +                                     source=answer_source({'engine_selection': target['timing_selection']})['label'])
@@ -3488,10 +3534,10 @@ index 0000000000000000000000000000000000000000..8549526f87a4b6d9733661156bf49c52
 +    print(verify())
 diff --git a/tests/test_html_chat.py b/tests/test_html_chat.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..4948cee059f02b17ec1794396ee2605f651f03c5
+index 0000000000000000000000000000000000000000..c07d591f772407f3e4a63596305d764ffd6bdadb
 --- /dev/null
 +++ b/tests/test_html_chat.py
-@@ -0,0 +1,1341 @@
+@@ -0,0 +1,1415 @@
 +from contextlib import contextmanager, nullcontext
 +import hashlib
 +from io import BytesIO
@@ -3746,6 +3792,80 @@ index 0000000000000000000000000000000000000000..4948cee059f02b17ec1794396ee2605f
 +        item, = answer_feedback.for_chat(self.store, self.sid, night)['items']
 +        self.assertEqual(item['correction'], '需要區分白天與夜間。')
 +        self.assertNotIn('confirmed_question', item)
++
++    def test_answer_commit_rechecks_the_feedback_sent_to_the_model_and_preserves_retry(self):
++        app = ChatApp(self.store, controlled=True)
++        old_answer, new_answer = '交給乙組。', '交給丁組。'
++        app.change_mode('chat')
++        self.addCleanup(app.close)
++
++        for change, station in (('withdraw', '東站'), ('revise', '西站'), ('training_only', '南站'), ('unrelated', '北站')):
++            with self.subTest(change=change):
++                question = f'{station}夜間檢修的申請交給哪組？'
++                sid = self.store.new_session('更正競態 ' + change)
++                message_id = self.store.add_answer(sid, '交給甲組。', {'current_request': question})
++                unrelated = self.store.add_answer(sid, '附件要存紙本。', {'current_request': '附件格式？'})
++
++                def target():
++                    return {'sid': sid, 'message_id': message_id, 'version': app.correction(sid, message_id)['version']}
++
++                item = app.confirm({**target(), 'prompt': question, 'answer': old_answer})
++                seen, release = Event(), Event()
++                prompt_contexts = []
++
++                def model(prompt, cancel):
++                    blob = prompt.rpartition('以下 JSON 是使用者資料與當前問題：\n')[2]
++                    feedback = json.loads(blob)['answer_feedback']['items']
++                    prompt_contexts.append(feedback)
++                    seen.set()
++                    if not release.wait(5):
++                        raise RuntimeError('synthetic answer timed out')
++                    return old_answer if len(prompt_contexts) == 1 else '依照目前的資料重新回答。'
++
++                with patch.object(app.engine, 'answer', side_effect=model):
++                    app.dispatch('ask', {'sid': sid, 'question': question})
++                    try:
++                        self.assertTrue(seen.wait(5))
++                        self.assertEqual(prompt_contexts[0][0]['correction'], old_answer)
++                        if change == 'withdraw':
++                            app.dispatch('withdraw-correction', target())
++                        elif change == 'revise':
++                            app.confirm({**target(), 'prompt': question, 'answer': new_answer})
++                        elif change == 'training_only':
++                            app.dispatch('withdraw', item)
++                        else:
++                            self.store.rate(unrelated, -1, '附件請用 PDF。')
++                    finally:
++                        release.set()
++                        app.worker.join(5)
++                    page = app.view(sid)
++                    if change in ('training_only', 'unrelated'):
++                        self.assertEqual(app.status()['stage'], 'done')
++                        self.assertEqual(page['messages'][-1]['content'], old_answer)
++                        self.assertIsNone(page['retry'])
++                        continue
++
++                    previous = answer_runs.runs(self.store, sid, 1)[0]
++                    self.assertEqual((previous['status'], previous['error_code']), ('failed', 'confirmed_feedback_changed'))
++                    self.assertIsNone(previous['answer_message_id'])
++                    self.assertEqual(page['messages'][-1]['content'], question)
++                    self.assertTrue(page['retry']['feedback_changed'])
++                    if change == 'withdraw':
++                        archive = create_backup(self.store.path)
++                        backup = self.store.path.parent / 'restored-during-answer'
++                        restore_backup(archive['path'], backup)
++                        restored = ChatApp(Store(backup / 'assistant.sqlite3'))
++                        self.assertTrue(restored.view(sid)['retry']['feedback_changed'])
++                    app.dispatch('retry', {'sid': sid, 'expected_run_id': page['retry']['id']})
++                    app.worker.join(5)
++                    self.assertEqual([row['correction'] for row in prompt_contexts[-1]],
++                                     [] if change == 'withdraw' else [new_answer])
++                    rows = app.view(sid)['messages']
++                    self.assertEqual(sum(row['role'] == 'user' for row in rows), 1)
++                    self.assertEqual(rows[-1]['content'], '依照目前的資料重新回答。')
++                    self.assertIsNone(app.view(sid)['retry'])
++
++        app.change_mode('off')
 +
 +    def test_api_requires_key_and_matching_origin(self):
 +        with server_for(self.app) as (address, token):

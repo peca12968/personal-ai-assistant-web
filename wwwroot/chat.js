@@ -216,7 +216,8 @@ function messageNode(row, sourceSid, retry = null) {
   }
   article.append(element('p', row.content));
   if (retry && row.role === 'user' && row.id === retry.user_message_id) {
-    const reason = {cancelled: '回答已停止', interrupted: '回答曾中斷', failed: '回答未完成'}[retry.status];
+    const reason = retry.feedback_changed ? '本輪帶入的更正已撤回或改版' :
+      {cancelled: '回答已停止', interrupted: '回答曾中斷', failed: '回答未完成'}[retry.status];
     article.append(element('small', reason + ' · 可重試', 'message-state'));
     if (retry.timing) {
       const timing = element('details', undefined, 'message-source');
