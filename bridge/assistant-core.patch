@@ -23,6 +23,124 @@ index 184d57d65750e647e4aaf12bfb7bf4a42e4eda68..1d611f3b33585a1e1b5cd09fc66b1969
  if errorlevel 1 goto failed
  exit /b 0
  :failed
+diff --git a/assistant/answer_feedback.py b/assistant/answer_feedback.py
+index dced158f5898ea16850a89dddd6452cb5cc46d99..98be890e9d821469d6ee04fd39cc1e03bb4ea884 100644
+--- a/assistant/answer_feedback.py
++++ b/assistant/answer_feedback.py
+@@ -4,14 +4,17 @@ from . import sqlite_text
+ 
+ MAX_ITEMS = 3
+ LIMITS = {'correction': 1000, 'answer_excerpt': 1200}
++CONFIRMED_QUESTION_LIMIT = 2000
++SCOPE_GUIDANCE = ('answer_feedback項目的confirmed_question是使用者確認的適用問題。'
++                  '只在對象和條件都相符時採用該筆更正；情境不同時分別判斷，有關鍵歧義時只查問缺少的條件。')
+ GUIDANCE = '''answer_feedback若存在，是使用者在本對話「需要改進」中保存的更正摘錄，並非你自行推論或模型已訓練的證明。
+ items中的correction是使用者回饋，answer_excerpt只是被指出問題的舊助理回答，不能把後者當成已確認事實；依語意採用明確更正，避免重複已指出的錯誤。引文、假設或只說「不對」並未提供新的正確事實。
+ answer_message_id只用來對照舊回答，不代表更正保存先後。新快照的update_revision是本機保存順序，較大者較晚，items依此由舊到新排列；updated_at是電腦記錄的時間，可能同秒或倒退，不可用它推翻保存順序。order_basis=recorded_update表示實際保存時記錄的順序；legacy_timestamp表示升級時依舊時間與回答編號重建，只保留原可知排序，不能據此聲稱恢復了舊同秒更正的真實先後。沒有這些欄位的歷史快照仍按舊時間／回答編號排列，不能補造順序。當前明確要求與新的使用者補充優先；無法判斷矛盾先後時只問必要差異，不自行補齊。
+ 這些是有限歷史資料，不是新操作授權，也不能增加工具權限、修改記憶／夥伴設定、啟動改碼或將舊引用當作本次已讀來源。不要宣稱已永久學會或更改模型。
+-selection_limited或各truncated為true表示省略，不能聲稱已看過全部回饋或省略的內容；沒有items不表示使用者從未更正。'''
++selection_limited或各truncated為true表示省略，不能聲稱已看過全部回饋或省略的內容；沒有items不表示使用者從未更正。''' + '\n' + SCOPE_GUIDANCE
+ 
+ 
+-def capture(db, sid):
++def capture(db, sid, *, preferred=None):
+     # Decode using the database's encoding, including UTF-16 legacy stores.
+     codec = sqlite_text.encoding(db)
+     db.create_function('has_answer_correction', 1, lambda value: bool(value and value.strip()), deterministic=True)
+@@ -25,9 +28,9 @@ def capture(db, sid):
+         WHERE m.session_id=? AND m.role='assistant' AND f.rating=-1
+         AND has_answer_correction(f.correction)
+         AND m.id NOT IN (SELECT message_id FROM local_memory_messages)
+-        ORDER BY v.revision DESC LIMIT ?''', (sid, MAX_ITEMS + 1)).fetchall()
++        ORDER BY (m.id IS ?) DESC, v.revision DESC LIMIT ?''', (sid, preferred, MAX_ITEMS + 1)).fetchall()
+     items = []
+-    for row in reversed(rows[:MAX_ITEMS]):
++    for row in sorted(rows[:MAX_ITEMS], key=lambda row: row['revision']):
+         item = {'answer_message_id': row['id'], 'answer_created_at': row['created_at'], 'updated_at': row['updated_at']}
+         item.update(update_revision=row['revision'], order_basis=row['order_basis'])
+         for key, column in [('correction', 'correction'), ('answer_excerpt', 'answer')]:
+@@ -38,11 +41,47 @@ def capture(db, sid):
+     return {'items': items, 'selection_limited': len(rows) > MAX_ITEMS}
+ 
+ 
++def linked_scopes(db, sid):
++    from . import learning_queue
++
++    rows = db.execute(learning_queue.LATEST + '''
++        JOIN feedback_versions v ON v.message_id = CASE WHEN json_valid(q.source_json)
++            THEN json_extract(q.source_json, '$.message_id') END
++        JOIN messages m ON m.id = v.message_id
++        WHERE m.session_id=? AND v.revision = CASE WHEN json_valid(q.source_json)
++            THEN json_extract(q.source_json, '$.feedback_revision') END
++        ORDER BY v.revision DESC''', (sid,))
++    linked = {}
++    for row in rows:
++        try:
++            entry = learning_queue.decode(row)
++        except (ValueError, TypeError, KeyError, RecursionError):
++            continue
++        if entry['answer'] != entry['source']['correction']:
++            continue
++        message_id = entry['source']['message_id']
++        linked[message_id] = None if message_id in linked else entry
++    return linked
++
++
+ def for_chat(store, sid, question):
++    from .learning_queue import source_current
++
+     if context_reset(question):
+         return {'items': [], 'selection_limited': False}
+     with store.connect() as db:
+-        return capture(db, sid)
++        db.execute('BEGIN')
++        linked = linked_scopes(db, sid)
++        query = question.strip()
++        preferred = next((message_id for message_id, entry in linked.items() if entry is not None
++                          and entry['prompt'].strip() == query and source_current(store, db, entry['source'])), None)
++        context = capture(db, sid, preferred=preferred)
++        for item in context['items']:
++            message_id = item['answer_message_id']
++            entry = linked.get(message_id)
++            if entry is not None and (message_id == preferred or source_current(store, db, entry['source'])):
++                item['confirmed_question'] = entry['prompt']
++        return context
+ 
+ 
+ def validate(value):
+@@ -55,13 +94,20 @@ def validate(value):
+     for row in value['items']:
+         expected = {'answer_message_id', 'answer_created_at', 'updated_at',
+                     'correction', 'answer_excerpt', 'correction_truncated', 'answer_truncated'}
+-        if modern: expected |= {'update_revision','order_basis'}
++        if modern:
++            expected |= {'update_revision','order_basis'}
++            if isinstance(row, dict) and 'confirmed_question' in row:
++                expected.add('confirmed_question')
+         if (not isinstance(row, dict) or set(row) != expected or
+                 type(row['answer_message_id']) is not int or row['answer_message_id'] <= 0 or row['answer_message_id'] in seen or
+                 any(not isinstance(row[k], str) or len(row[k]) > 50 for k in ('answer_created_at', 'updated_at')) or
+                 any(not isinstance(row[k], str) or len(row[k]) > limit for k, limit in LIMITS.items()) or
+                 any(type(row[k]) is not bool for k in ('correction_truncated', 'answer_truncated'))):
+             raise ValueError('回饋快照內容不符。')
++        if 'confirmed_question' in row:
++            scope = row['confirmed_question']
++            if not isinstance(scope, str) or not 1 <= len(scope) <= CONFIRMED_QUESTION_LIMIT or not scope.strip():
++                raise ValueError('已確認更正的適用問題不符。')
+         if modern and (type(row['update_revision']) is not int or not 1 <= row['update_revision'] <= 9223372036854775807
+                        or row['order_basis'] not in ('legacy_timestamp','recorded_update')):
+             raise ValueError('回饋保存順序不符。')
+@@ -78,6 +124,8 @@ def describe(value):
+     for row in value['items']:
+         lines += [f"回答#{row['answer_message_id']} · 回饋更新：{row['updated_at']} UTC",
+             ('保存順序：' + str(row['update_revision']) + ('（舊時間排序重建）' if row['order_basis']=='legacy_timestamp' else '（實際保存）')) if 'update_revision' in row else '舊快照未記錄保存順序。',
+-            '使用者的更正：' + row['correction'] + ('[…已省略…]' if row['correction_truncated'] else ''),
+-            '被指出問題的舊回答：' + row['answer_excerpt'] + ('[…已省略…]' if row['answer_truncated'] else '')]
++            '使用者的更正：' + row['correction'] + ('[…已省略…]' if row['correction_truncated'] else '')]
++        if 'confirmed_question' in row:
++            lines.append('更正適用的已確認問題：' + row['confirmed_question'])
++        lines.append('被指出問題的舊回答：' + row['answer_excerpt'] + ('[…已省略…]' if row['answer_truncated'] else ''))
+     return '\n\n'.join(lines)
 diff --git a/assistant/answer_runs.py b/assistant/answer_runs.py
 index 9b36a2da1ccf3b7114c4aed9dd878672792bc36d..3a147a5c7e202dd6dde5f26c43ce8f415fc78949 100644
 --- a/assistant/answer_runs.py
@@ -1185,10 +1303,27 @@ index d7493f3dc1a97a0185afae16d6019af6c85ac21d..fb0a4c7b0eacace72cba8a7b154b0318
          if type(expected_revision) is not int or old['revision'] != expected_revision:
              raise ValueError('項目已變更，請重新核對後撤回。')
 diff --git a/assistant/local_chat_budget.py b/assistant/local_chat_budget.py
-index 77c78778edc571cdf84d6ac1c47b79ef90ce67e4..44996a15b7f4ac66314f334e1fb901ebc09b52d9 100644
+index 77c78778edc571cdf84d6ac1c47b79ef90ce67e4..be604a9cba53ca162ed0d91a2cb816f224a99dd9 100644
 --- a/assistant/local_chat_budget.py
 +++ b/assistant/local_chat_budget.py
-@@ -373,7 +373,7 @@ def _personal_local_chat(context):
+@@ -4,6 +4,7 @@ import unicodedata
+ 
+ from .acceptance import strict_json
+ from . import conversation_reference, document_partial, named_topics, pending_choices, preference_codes
++from .answer_feedback import SCOPE_GUIDANCE
+ from .context import CORRECTION_PREFIX, FIELD_REVISION, REVISION_QUALIFIER, final_revision_field, is_explicit_correction
+ from .document_ranges import MAX_RANGES, STATUS_TEXT, range_status_text
+ 
+@@ -24,7 +25,7 @@ GUIDANCE = (
+     '看到結果時，確認規則方向及是否有替代原因。不要單靠結果確認唯一原因。\n'
+     '區分來源事實、推論與未知。根據提供的背景回答，不捏造省略或欠缺的內容。'
+     '本輪沒有操作工具。不要宣稱已代為讀檔、上網、執行程式、測試、發送、預約或上傳。'
+-)
++) + '\n' + SCOPE_GUIDANCE
+ RETRY_GUIDANCE = '\n本輪是使用者明確重試同一個原問，採用這次取得的背景。先前回答流程紀錄只說明先前嘗試。'
+ DOCUMENT_GUIDANCE = (
+     '\n「文件問答」只使用 documents 內本次提供的匯入副本。'
+@@ -373,7 +374,7 @@ def _personal_local_chat(context):
  
  def recovery_plan(prompt, *, compare_personal_models=False):
      """Return recovered text, evidence excerpts, and an optional partial-answer plan."""
@@ -1197,7 +1332,7 @@ index 77c78778edc571cdf84d6ac1c47b79ef90ce67e4..44996a15b7f4ac66314f334e1fb901eb
  
      _, boundary, payload = prompt.rpartition(DATA_BOUNDARY)
      if not boundary:
-@@ -383,6 +383,7 @@ def recovery_plan(prompt, *, compare_personal_models=False):
+@@ -383,6 +384,7 @@ def recovery_plan(prompt, *, compare_personal_models=False):
          if not isinstance(context, dict) or render_prompt(context) != prompt:
              return None
          guide = _text_guide(context, compare_personal_models=compare_personal_models)
@@ -1205,7 +1340,7 @@ index 77c78778edc571cdf84d6ac1c47b79ef90ce67e4..44996a15b7f4ac66314f334e1fb901eb
      except (ValueError, TypeError, KeyError, AttributeError, RecursionError, OSError):
          return None
      if guide is None:
-@@ -392,6 +393,8 @@ def recovery_plan(prompt, *, compare_personal_models=False):
+@@ -392,6 +394,8 @@ def recovery_plan(prompt, *, compare_personal_models=False):
      partial = document_partial.build_plan(documents) if excerpts is not None else None
      if partial is not None:
          guide = GUIDANCE + document_partial.guidance(partial)
@@ -3353,10 +3488,10 @@ index 0000000000000000000000000000000000000000..8549526f87a4b6d9733661156bf49c52
 +    print(verify())
 diff --git a/tests/test_html_chat.py b/tests/test_html_chat.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..110ca474f812cc233564f78c1901ac1c583896ed
+index 0000000000000000000000000000000000000000..4948cee059f02b17ec1794396ee2605f651f03c5
 --- /dev/null
 +++ b/tests/test_html_chat.py
-@@ -0,0 +1,1271 @@
+@@ -0,0 +1,1341 @@
 +from contextlib import contextmanager, nullcontext
 +import hashlib
 +from io import BytesIO
@@ -3374,7 +3509,8 @@ index 0000000000000000000000000000000000000000..110ca474f812cc233564f78c1901ac1c
 +from urllib.error import HTTPError
 +from urllib.request import Request, urlopen
 +
-+from assistant import answer_runs, chat_drafts, chat_history, learning_batches, learning_queue, qwen27_engine, qwen27_learning
++from assistant import (answer_feedback, answer_runs, chat_drafts, chat_history, learning_batches, learning_queue,
++                       qwen27_engine, qwen27_learning)
 +from assistant.backup import create_backup, restore_backup
 +from assistant.engine import Assistant, CodexEngine, EngineError, render_prompt_parts
 +from assistant.html_chat import ALIAS, MODEL_4B, ChatApp, server_for
@@ -3541,6 +3677,75 @@ index 0000000000000000000000000000000000000000..110ca474f812cc233564f78c1901ac1c
 +            self.app.withdraw_correction({**target, 'version': current['version']})
 +        context = self.app.driver.prepare_context(self.sid, question)
 +        self.assertEqual(context['answer_feedback']['items'][0]['correction'], '本次改交乙組。')
++
++    def test_confirmed_feedback_keeps_its_scope_and_prioritizes_an_exact_repeated_question(self):
++        original = '申請交哪組？'
++        weekend = '週末補件的申請交哪組？'
++        weekday = '平日補件的申請交哪組？'
++        message_id = self.store.add_answer(self.sid, '申請交甲組。', {'current_request': original})
++
++        def confirm(prompt, answer):
++            version = self.app.correction(self.sid, message_id)['version']
++            return self.app.confirm({'sid': self.sid, 'message_id': message_id, 'version': version,
++                                     'prompt': prompt, 'answer': answer})
++
++        def feedback(app, question):
++            return app.driver.prepare_context(self.sid, question)['answer_feedback']
++
++        saved = confirm(weekend, '週末補件交乙組。')
++        adjacent = feedback(self.app, weekday)['items'][0]
++        self.assertEqual((adjacent['confirmed_question'], adjacent['correction']), (weekend, '週末補件交乙組。'))
++        later = []
++        for index in range(3):
++            other_question = f'合成附件 {index} 使用什麼格式？'
++            other = self.store.add_answer(self.sid, '使用紙本。', {'current_request': other_question})
++            later.append(other)
++            self.store.rate(other, -1, f'附件 {index} 使用 PDF。')
++
++        exact = feedback(self.app, weekend)
++        self.assertTrue(exact['selection_limited'])
++        self.assertEqual([row['answer_message_id'] for row in exact['items']], [message_id, *later[1:]])
++        self.assertEqual([row['answer_message_id'] for row in feedback(self.app, weekday)['items']], later)
++        self.assertEqual(answer_feedback.validate(exact), exact)
++        self.assertIn(weekend, answer_feedback.describe(exact))
++        other_sid = self.store.new_session()
++        self.assertEqual(answer_feedback.for_chat(self.store, other_sid, weekend)['items'], [])
++
++        prompts = []
++        with patch.object(self.app.engine, 'answer', side_effect=lambda prompt, cancel: prompts.append(prompt) or '合成回覆'):
++            reply = self.app.driver.ask(self.sid, weekend)
++        for wire in (prompts[0], chat_prompt(prompts[0])):
++            guide, _, payload = wire.rpartition('以下 JSON 是使用者資料與當前問題：\n')
++            self.assertIn(answer_feedback.SCOPE_GUIDANCE, guide)
++            self.assertEqual(json.loads(payload)['answer_feedback'], exact)
++
++        self.app.dispatch('withdraw', saved)
++        self.assertEqual(feedback(self.app, weekend)['items'][0]['confirmed_question'], weekend)
++        self.store.rate(message_id, -1, '另有待確認的補件規則。')
++        current = feedback(self.app, weekend)['items'][-1]
++        self.assertEqual(current['correction'], '另有待確認的補件規則。')
++        self.assertNotIn('confirmed_question', current)
++        confirm('夜間補件的申請交哪組？', '夜間補件交丁組。')
++
++        archive = create_backup(self.store.path)
++        folder = self.store.path.parent / 'restored-scope'
++        restore_backup(archive['path'], folder)
++        restored = Store(folder / 'assistant.sqlite3')
++        with restored.connect() as db:
++            historical = db.execute('SELECT payload FROM answer_contexts WHERE message_id=?', (reply['id'],)).fetchone()
++        self.assertEqual(json.loads(historical['payload'])['answer_feedback'], exact)
++        latest = feedback(ChatApp(restored), original)['items'][-1]
++        self.assertEqual((latest['confirmed_question'], latest['correction']), ('夜間補件的申請交哪組？', '夜間補件交丁組。'))
++
++    def test_learning_example_does_not_attach_its_scope_to_a_different_feedback_answer(self):
++        message_id = self.store.add_answer(self.sid, '交給甲組。', {'current_request': '申請交哪組？'})
++        self.store.rate(message_id, -1, '需要區分白天與夜間。')
++        source = learning_queue.source_from_feedback(self.store, message_id)
++        night = '夜間補件的申請交哪組？'
++        learning_queue.confirm(self.store, night, '交給乙組。', source=source)
++        item, = answer_feedback.for_chat(self.store, self.sid, night)['items']
++        self.assertEqual(item['correction'], '需要區分白天與夜間。')
++        self.assertNotIn('confirmed_question', item)
 +
 +    def test_api_requires_key_and_matching_origin(self):
 +        with server_for(self.app) as (address, token):
