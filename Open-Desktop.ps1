@@ -34,13 +34,7 @@ try {
     }
     if ($BridgeOnly) { return }
     $url = "http://127.0.0.1:$Port/#key=$siteKey"
-    $programs = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFilesX86)
-    $edge = Join-Path $programs 'Microsoft\Edge\Application\msedge.exe'
-    if (Test-Path -LiteralPath $edge) {
-        Start-Process -FilePath $edge -ArgumentList "--app=$url"
-    } else {
-        Start-Process $url
-    }
+    Start-Process $url
 }
 catch {
     Add-Type -AssemblyName System.Windows.Forms

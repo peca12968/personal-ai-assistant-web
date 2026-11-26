@@ -18,7 +18,7 @@ var readable = new HashSet<string> { "view", "status", "learning", "trash" };
 var writable = new HashSet<string>
 {
     "new", "ask", "retry", "confirm", "withdraw", "learn", "stop", "select",
-    "mode", "trash", "restore", "purge"
+    "mode", "trash", "restore", "purge", "connect"
 };
 
 app.Use(async (context, next) =>
@@ -51,7 +51,11 @@ app.MapMethods("/api/{operation}", new[] { "GET", "POST" }, async (
     }
 
     var key = await ReadText(Path.Combine(runtimePath, "site.key"), http.RequestAborted);
-    if (key is null || !TokenEquals(request.Headers.Authorization.ToString(), "Bearer " + key.Trim()))
+    const string desktopCookie = "PAI.Desktop";
+    var expected = key?.Trim() ?? "";
+    var hasKey = expected.Length >= 40 && TokenEquals(request.Headers.Authorization.ToString(), "Bearer " + expected);
+    var hasSession = TokenEquals(request.Cookies[desktopCookie] ?? "", expected);
+    if (!hasKey && (!hasSession || operation == "connect"))
     {
         await Error(http, StatusCodes.Status401Unauthorized, "請從桌面捷徑開啟此頁。");
         return;
@@ -60,6 +64,15 @@ app.MapMethods("/api/{operation}", new[] { "GET", "POST" }, async (
     if (!read && request.Headers.Origin.ToString() != $"{request.Scheme}://{request.Host}")
     {
         await Error(http, StatusCodes.Status403Forbidden, "無法核對桌面視窗來源。");
+        return;
+    }
+    if (operation == "connect")
+    {
+        http.Response.Cookies.Append(desktopCookie, expected, new CookieOptions
+        {
+            HttpOnly = true, SameSite = SameSiteMode.Strict, Secure = request.IsHttps, Path = "/api"
+        });
+        await http.Response.WriteAsJsonAsync(new { connected = true }, cancellationToken: http.RequestAborted);
         return;
     }
 

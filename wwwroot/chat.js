@@ -1,29 +1,42 @@
 'use strict';
 const $ = id => document.getElementById(id);
 const fragment = new URLSearchParams(location.hash.slice(1));
-const token = fragment.get('key') || sessionStorage.getItem('chatKey');
+let token = fragment.get('key') || sessionStorage.getItem('chatKey');
 if (fragment.has('key')) {
-  sessionStorage.setItem('chatKey', token);
   history.replaceState(null, '', location.pathname);
 }
+let connected = false;
 let sid = null;
-let correctionId = null;
+let correctionTarget = null;
+let viewRevision = 0;
+let viewLoading = false;
+let historyCursor = null;
+let olderLoading = false;
 let job = null;
 let lastJob = null;
 let pending = false;
 let mode = 'off';
 let switching = false;
+let requestedMode = null;
+let powerRevision = 0;
 
 async function api(route, data) {
-  const headers = {Authorization: 'Bearer ' + token};
+  const headers = token ? {Authorization: 'Bearer ' + token} : {};
   const options = {headers};
   if (data !== undefined) {
     headers['Content-Type'] = 'application/json';
     Object.assign(options, {method: 'POST', body: JSON.stringify(data)});
   }
   const response = await fetch('/api/' + route, options);
-  const payload = await response.json();
-  if (!response.ok) throw new Error(payload.error || '本機助理未完成這次操作。');
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    if (response.status === 401) {
+      connected = false;
+      $('connect-notice').textContent = '此分頁尚未連線。請從桌面「個人助理對話」開啟一次。';
+      busyState();
+    }
+    throw new Error(payload.error || ('本機網站回報 HTTP ' + response.status + '。'));
+  }
   return payload;
 }
 function element(tag, text, css) {
@@ -41,53 +54,108 @@ function action(text, fn, css) {
 function showStatus(text) { $('status').textContent = text; }
 function busyState() {
   const inProgress = pending || switching || Boolean(job && job.running);
-  $('send').disabled = $('retry').disabled = inProgress || mode !== 'chat';
-  $('trash-current').disabled = $('new-chat').disabled = inProgress;
-  $('chat-power').checked = mode === 'chat';
-  $('training-power').checked = mode === 'training';
-  $('chat-power').disabled = $('training-power').disabled = switching;
+  $('connect-notice').hidden = connected;
+  $('send').disabled = $('retry').disabled = !connected || inProgress || viewLoading || mode !== 'chat';
+  $('new-chat').disabled = !connected || inProgress;
+  $('trash-current').disabled = !connected || inProgress || viewLoading;
+  $('trash-list').disabled = $('learning').disabled = !connected;
+  $('older-messages').hidden = !historyCursor;
+  $('older-messages').disabled = !connected || viewLoading || olderLoading;
+  const shownMode = requestedMode ?? mode;
+  $('chat-power').checked = shownMode === 'chat';
+  $('training-power').checked = shownMode === 'training';
+  $('chat-power').disabled = $('training-power').disabled = !connected || switching;
+  $('mode-status').textContent = !connected ? '桌面連線未就緒' : switching ? '正在切換…' :
+    {off: '使用模型與訓練已關閉', chat: '使用模型已開啟 · 可送出訊息',
+      training: '訓練已開啟 · 可安排微調', stopping: '正在確認模型程序退出'}[mode] || '';
   $('stop').hidden = !inProgress;
   $('stop-learning').hidden = !(job?.running && job.kind === 'learning');
-  $('start-learning').disabled = inProgress || mode !== 'training';
+  $('start-learning').disabled = !connected || inProgress || mode !== 'training';
 }
-function showMessage(row) {
+function messageNode(row, sourceSid) {
   const article = element('article', undefined, 'message ' + row.role);
   article.append(element('div', row.role === 'user' ? '你' : '助理', 'speaker'));
   article.append(element('p', row.content));
   if (row.correctable) {
     article.append(action('更正這則回答', () => {
-      correctionId = row.id;
+      correctionTarget = {sid: sourceSid, message_id: row.id};
       $('correct-question').value = row.question;
       $('correct-answer').value = row.correction || '';
       $('correction-status').textContent = '';
       $('correction-dialog').showModal();
     }));
   }
-  $('history').append(article);
+  return article;
 }
-async function load() {
-  const state = await api('view' + (sid ? '?sid=' + encodeURIComponent(sid) : ''));
+async function load(targetSid = sid) {
+  const revision = ++viewRevision;
+  const powerAtRequest = powerRevision;
+  viewLoading = true;
+  olderLoading = false;
+  busyState();
+  try {
+    const state = await api('view' + (targetSid ? '?sid=' + encodeURIComponent(targetSid) : ''));
+    if (revision !== viewRevision) return;
+    connected = true;
+    showView(state, powerAtRequest);
+  } catch (error) {
+    if (revision === viewRevision) throw error;
+  } finally {
+    if (revision === viewRevision) {
+      viewLoading = false;
+      busyState();
+    }
+  }
+}
+function showView(state, powerAtRequest) {
   sid = state.sid;
-  if (!switching) mode = state.mode;
+  historyCursor = state.before;
+  if (!switching && powerAtRequest === powerRevision) mode = state.mode;
   busyState();
   $('model').textContent = state.model;
   if (state.warning) showStatus(state.warning);
   $('title').textContent = state.title;
   $('sessions').replaceChildren(...state.sessions.map(row => {
     const button = action(row.title, async () => {
-      sid = row.id;
       $('sidebar').classList.remove('open');
-      await load().catch(error => showStatus(error.message));
+      await load(row.id).catch(error => showStatus(error.message));
     }, 'session');
     button.setAttribute('aria-current', String(row.id === sid));
     button.title = row.title;
     return button;
   }));
-  $('history').replaceChildren();
-  state.messages.forEach(showMessage);
+  $('messages').replaceChildren(...state.messages.map(row => messageNode(row, state.sid)));
   $('history').scrollTop = $('history').scrollHeight;
   $('retry').hidden = !state.can_retry;
 }
+$('older-messages').addEventListener('click', async () => {
+  if (viewLoading || olderLoading || !historyCursor) return;
+  const revision = viewRevision;
+  const sourceSid = sid;
+  const query = new URLSearchParams({sid: sourceSid, before: historyCursor});
+  olderLoading = true;
+  busyState();
+  try {
+    const page = await api('view?' + query);
+    if (revision !== viewRevision) return;
+    if (page.sid !== sourceSid) throw new Error('這段歷史的來源已變更，請重開對話。');
+    const panel = $('history');
+    const oldHeight = panel.scrollHeight;
+    const oldPosition = panel.scrollTop;
+    $('messages').prepend(...page.messages.map(row => messageNode(row, sourceSid)));
+    historyCursor = page.before;
+    busyState();
+    panel.scrollTop = oldPosition + panel.scrollHeight - oldHeight;
+  } catch (error) {
+    if (revision === viewRevision) showStatus(error.message);
+  } finally {
+    if (revision === viewRevision) {
+      olderLoading = false;
+      busyState();
+      if (!historyCursor) $('history').focus();
+    }
+  }
+});
 const stages = {
   queued: '等待本機程序', answering: '本機模型正在回答',
   waiting: '等候電腦連續閒置 10 分鐘', baseline: '正在量測微調前的回答',
@@ -97,9 +165,10 @@ const stages = {
   stale: '確認更正已變更', done: '已完成', failed: '本次未完成', cancelled: '已停止'
 };
 async function poll() {
+  const powerAtRequest = powerRevision;
   try {
     job = await api('status');
-    if (!switching) mode = job.mode;
+    if (!switching && powerAtRequest === powerRevision) mode = job.mode;
     const state = job.stage ? stages[job.stage] || job.stage : '';
     if (job.id && (job.running || lastJob !== job.id)) {
       const notice = [state, job.error].filter(Boolean).join(' · ');
@@ -107,7 +176,7 @@ async function poll() {
       if (job.kind === 'learning') $('learning-status').textContent = notice;
       if (!job.running) {
         lastJob = job.id;
-        await load();
+        if (!viewLoading) await load();
         if ($('learning-dialog').open) await learningData();
       }
     }
@@ -115,7 +184,7 @@ async function poll() {
   } catch (error) {
     showStatus(error.message);
   } finally {
-    setTimeout(poll, 900);
+    if (connected) setTimeout(poll, 900);
   }
 }
 async function start(route, data) {
@@ -136,11 +205,14 @@ async function start(route, data) {
 $('chat-form').addEventListener('submit', async event => {
   event.preventDefault();
   const question = $('question').value.trim();
-  if (!question || pending || job?.running || mode !== 'chat') return;
-  if (await start('ask', {sid, question})) {
+  if (!connected || !question || pending || viewLoading || job?.running || mode !== 'chat') return;
+  const sourceSid = sid;
+  if (await start('ask', {sid: sourceSid, question})) {
     $('question').value = '';
-    showMessage({role: 'user', content: question});
-    $('history').scrollTop = $('history').scrollHeight;
+    if (sid === sourceSid && !viewLoading) {
+      $('messages').append(messageNode({role: 'user', content: question}, sourceSid));
+      $('history').scrollTop = $('history').scrollHeight;
+    }
   }
 });
 $('question').addEventListener('keydown', event => {
@@ -152,9 +224,9 @@ $('question').addEventListener('keydown', event => {
 $('retry').addEventListener('click', () => start('retry', {sid}));
 $('new-chat').addEventListener('click', async () => {
   try {
-    sid = (await api('new', {})).sid;
+    const created = (await api('new', {})).sid;
     $('sidebar').classList.remove('open');
-    await load();
+    await load(created);
     $('question').focus();
   } catch (error) { showStatus(error.message); }
 });
@@ -171,7 +243,7 @@ $('correction-form').addEventListener('submit', async event => {
   const button = event.submitter;
   button.disabled = true;
   try {
-    await api('confirm', {sid, message_id: correctionId, prompt: $('correct-question').value.trim(),
+    await api('confirm', {...correctionTarget, prompt: $('correct-question').value.trim(),
       answer: $('correct-answer').value.trim()});
     $('correction-dialog').close();
     showStatus('確認更正已加入本機學習佇列。');
@@ -238,8 +310,10 @@ $('learning-form').addEventListener('submit', async event => {
   } catch (error) { $('learning-status').textContent = error.message; }
 });
 async function changePower(requested) {
-  if (switching) return;
+  if (!connected || switching) return;
+  powerRevision++;
   switching = true;
+  requestedMode = requested;
   busyState();
   if (job?.running) showStatus('正在停止本機模型程序');
   try {
@@ -248,15 +322,21 @@ async function changePower(requested) {
   } catch (error) {
     showStatus(error.message);
   } finally {
+    powerRevision++;
     switching = false;
+    requestedMode = null;
     busyState();
   }
 }
 $('chat-power').addEventListener('change', event => changePower(event.target.checked ? 'chat' : 'off'));
 $('training-power').addEventListener('change', event => changePower(event.target.checked ? 'training' : 'off'));
 $('trash-current').addEventListener('click', async () => {
-  if (!sid || !confirm('將目前對話移到回收筒？之後可以還原。')) return;
-  try { await api('trash', {sid}); sid = null; await load(); }
+  const sourceSid = sid;
+  if (!sourceSid || viewLoading || !confirm('將目前對話移到回收筒？之後可以還原。')) return;
+  try {
+    await api('trash', {sid: sourceSid});
+    if (!viewLoading) await load(sid === sourceSid ? null : sid);
+  }
   catch (error) { showStatus(error.message); }
 });
 async function loadTrash() {
@@ -289,7 +369,18 @@ $('trash-list').addEventListener('click', async () => {
   try { await loadTrash(); }
   catch (error) { $('trash-status').textContent = error.message; }
 });
-showStatus('模型與訓練已關閉');
 busyState();
-load().catch(error => showStatus(error.message));
-poll();
+async function connectDesktop() {
+  try {
+    if (token) {
+      await api('connect', {});
+      sessionStorage.removeItem('chatKey');
+      token = null;
+    }
+    await load();
+    poll();
+  } catch (error) {
+    if (!connected) $('connect-notice').textContent = error.message;
+  }
+}
+connectDesktop();

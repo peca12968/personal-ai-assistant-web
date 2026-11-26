@@ -18,15 +18,19 @@
   <main>
     <header>
       <button class="menu-button" id="open-sidebar" type="button" aria-label="對話清單">☰</button>
-      <div class="conversation"><h1 id="title">新對話</h1><p id="model">Qwen3.8-27B BF16</p></div>
+      <div class="conversation"><h1 id="title">新對話</h1><p id="model">Qwen3.8-27B BF16</p><p id="mode-status" role="status"></p></div>
       <div class="power" aria-label="模型運作模式">
         <label class="toggle"><input id="chat-power" type="checkbox" role="switch">使用模型</label>
         <label class="toggle"><input id="training-power" type="checkbox" role="switch">訓練</label>
       </div>
       <button id="trash-current" type="button">移到回收筒</button>
     </header>
-    <section class="history" id="history" aria-label="對話" aria-live="polite"></section>
+    <section class="history" id="history" tabindex="-1" aria-label="對話">
+      <button id="older-messages" type="button" aria-controls="messages" hidden>載入更早訊息</button>
+      <div id="messages" aria-live="polite"></div>
+    </section>
     <section class="composer">
+      <p id="connect-notice" role="status">正在核對桌面連線。</p>
       <p id="status" role="status"></p>
       <form id="chat-form">
         <label class="sr-only" for="question">輸入訊息</label>
