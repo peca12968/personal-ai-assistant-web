@@ -24,10 +24,20 @@ index 184d57d65750e647e4aaf12bfb7bf4a42e4eda68..1d611f3b33585a1e1b5cd09fc66b1969
  exit /b 0
  :failed
 diff --git a/assistant/answer_runs.py b/assistant/answer_runs.py
-index 9b36a2da1ccf3b7114c4aed9dd878672792bc36d..8d67fa2f9d289e1677638bd253f661bffc1006fc 100644
+index 9b36a2da1ccf3b7114c4aed9dd878672792bc36d..c4943435bac1feeedf831de0af6f53143becada9 100644
 --- a/assistant/answer_runs.py
 +++ b/assistant/answer_runs.py
-@@ -36,6 +36,10 @@ class LeaseBusy(RuntimeError):
+@@ -5,6 +5,9 @@ import sqlite3
+ from contextlib import contextmanager
+ 
+ 
++ORIGIN_FIELD = 'answer_origin'
++
++
+ ERROR_LABELS = {
+     'evidence_invalid': '本機條件核對未完成，請用相同命題名稱分別寫明規則、觀察和待判問題。',
+     'transcription_invalid': '本機逐字轉錄未完成；來源、格式或輸出核對失敗，沒有保存完成答案。',
+@@ -36,6 +39,10 @@ class LeaseBusy(RuntimeError):
      pass
  
  
@@ -38,7 +48,7 @@ index 9b36a2da1ccf3b7114c4aed9dd878672792bc36d..8d67fa2f9d289e1677638bd253f661bf
  @contextmanager
  def lease(store, run_id):
      if not isinstance(run_id, str) or not re.fullmatch(r'[0-9a-f]{32}', run_id):
-@@ -74,21 +78,37 @@ def recover(store, sid):
+@@ -74,21 +81,37 @@ def recover(store, sid):
              continue
  
  
@@ -83,6 +93,25 @@ index 9b36a2da1ccf3b7114c4aed9dd878672792bc36d..8d67fa2f9d289e1677638bd253f661bf
          if db.execute("SELECT 1 FROM answer_runs WHERE session_id=? AND status='running'", (sid,)).fetchone():
              raise ValueError('目前對話已有尚未完成的回答流程，請先等候或停止。')
          if 'image_inputs' in context:
+@@ -121,7 +144,7 @@ def begin(store, sid, run_id, question, context, retry=None, draft=None):
+     return uid
+ 
+ 
+-def finish(store, run_id, answer, context, checks, *, delivery=None):
++def finish(store, run_id, answer, context, checks, *, delivery=None, origin=None):
+     with store.connect() as db:
+         db.execute('BEGIN IMMEDIATE')
+         row = db.execute("SELECT session_id,user_message_id FROM answer_runs WHERE id=? AND status='running'",
+@@ -141,7 +164,8 @@ def finish(store, run_id, answer, context, checks, *, delivery=None):
+                 raise ValueError('交付所需的對話已變更，沒有另存答案。')
+             check_clarification_history(db, context, row['session_id'], row['user_message_id'])
+         mid = db.execute("INSERT INTO messages(session_id,role,content) VALUES(?,'assistant',?)", (row['session_id'], answer)).lastrowid
+-        db.execute('INSERT INTO answer_contexts(message_id,payload) VALUES(?,?)', (mid, json.dumps(context, ensure_ascii=False)))
++        saved_context = {**context, ORIGIN_FIELD: origin} if origin is not None else context
++        db.execute('INSERT INTO answer_contexts(message_id,payload) VALUES(?,?)', (mid, json.dumps(saved_context, ensure_ascii=False)))
+         db.execute('INSERT INTO answer_checks(message_id,payload) VALUES(?,?)', (mid, json.dumps(checks, ensure_ascii=False)))
+         if delivery is not None:
+             from .response_delivery import save
 diff --git a/assistant/backup.py b/assistant/backup.py
 index c3144cc593526602d4195267d244bc9e9c9d28fd..01da10bf4da6c8cff4196cd9d2355d266739e27e 100644
 --- a/assistant/backup.py
@@ -219,7 +248,7 @@ index 0000000000000000000000000000000000000000..db2b786e52eb43790257332b13475e81
 +    db.execute("UPDATE sessions SET title='已永久刪除的對話' WHERE id=?", (sid,))
 +    db.execute("UPDATE chat_history_state SET state='purged',changed_at=CURRENT_TIMESTAMP WHERE session_id=?", (sid,))
 diff --git a/assistant/engine.py b/assistant/engine.py
-index 78bfad433d1abe8c476e44d04bc20f8b5c167020..f5b459149ed94ea6f8c6ee51bb836daf2049a2d5 100644
+index 78bfad433d1abe8c476e44d04bc20f8b5c167020..2de04c5a76454b3f1c60eaa0e2687245d1ef579b 100644
 --- a/assistant/engine.py
 +++ b/assistant/engine.py
 @@ -29,6 +29,16 @@ ROOT = Path(__file__).resolve().parents[1]
@@ -239,7 +268,16 @@ index 78bfad433d1abe8c476e44d04bc20f8b5c167020..f5b459149ed94ea6f8c6ee51bb836daf
  
  
  class EngineError(RuntimeError):
-@@ -81,8 +91,11 @@ def render_prompt_parts(context):
+@@ -75,14 +85,18 @@ def find_codex():
+ 
+ 
+ def render_prompt_parts(context):
+-    if work_delivery.HISTORY_KEY in context:
+-        context = {key: value for key, value in context.items() if key != work_delivery.HISTORY_KEY}
++    private_fields = {work_delivery.HISTORY_KEY, answer_runs.ORIGIN_FIELD}
++    if private_fields.intersection(context):
++        context = {key: value for key, value in context.items() if key not in private_fields}
+     isolated = context.get('context_scope') == CURRENT_MESSAGE_ONLY
      if isolated and 'retry_of' in context:
          # This is local run provenance, not a source for a standalone answer.
          context = {key: value for key, value in context.items() if key != 'retry_of'}
@@ -253,7 +291,7 @@ index 78bfad433d1abe8c476e44d04bc20f8b5c167020..f5b459149ed94ea6f8c6ee51bb836daf
      from .prompt_scope import (TRANSCRIPTION_GUIDANCE, transcription_focus, transcription_format,
                                OUTER_GUIDANCE, transcription_source, SOURCE_GUIDANCE, transcription_block)
      policy = policy_reference(context)
-@@ -96,7 +109,12 @@ def render_prompt_parts(context):
+@@ -96,7 +110,12 @@ def render_prompt_parts(context):
      if copy_focus:
          instructions = TRANSCRIPTION_GUIDANCE
      else:
@@ -267,7 +305,7 @@ index 78bfad433d1abe8c476e44d04bc20f8b5c167020..f5b459149ed94ea6f8c6ee51bb836daf
      instructions += '\n' + (ROOT / 'prompts/communication.txt').read_text(encoding='utf-8')
      instructions += '\n' + COMPANION_GUIDANCE
      instructions += '\n' + answer_feedback.GUIDANCE
-@@ -205,6 +223,11 @@ class CodexEngine:
+@@ -205,6 +224,11 @@ class CodexEngine:
              raise EngineError('無法讀寫本機推理暫存資料，請檢查磁碟空間與存取權限。', 'local_io') from None
  
      def _answer(self, payload, check_running, images=()):
@@ -279,7 +317,7 @@ index 78bfad433d1abe8c476e44d04bc20f8b5c167020..f5b459149ed94ea6f8c6ee51bb836daf
          with answer_directory(self.workdir) as tmp:
              output = Path(tmp) / "answer.txt"
              # A seekable stdin file avoids a blocked parent-side pipe write when the
-@@ -286,7 +309,7 @@ class Assistant:
+@@ -286,7 +310,7 @@ class Assistant:
          describe = getattr(self.engine, 'describe', None)
          if callable(describe):
              context['engine_selection'] = describe()
@@ -288,7 +326,7 @@ index 78bfad433d1abe8c476e44d04bc20f8b5c167020..f5b459149ed94ea6f8c6ee51bb836daf
              from .learning_queue import help_context
              learning_help = help_context(question + ('\n' + followup if followup else ''))
              if learning_help is not None:
-@@ -358,8 +381,8 @@ class Assistant:
+@@ -358,8 +382,8 @@ class Assistant:
      def ask(self, sid, question, cancel=None, *, draft=None, image_ids=()):
          return self._ask(sid, question, cancel, draft=draft, image_ids=image_ids)
  
@@ -299,12 +337,49 @@ index 78bfad433d1abe8c476e44d04bc20f8b5c167020..f5b459149ed94ea6f8c6ee51bb836daf
          return self._ask(sid, target['question'], cancel, retry=target)
  
      def _ask(self, sid, question, cancel=None, retry=None, draft=None, image_ids=()):
+@@ -491,6 +515,7 @@ class Assistant:
+             try:
+                 delivery = None
+                 verified_choice = None
++                origin = 'local_tool'
+                 if tone_read:
+                     answer, receipt = profile_tone_read.evaluate(context[profile_tone_read.FIELD])
+                     context[profile_tone_read.FIELD] = receipt
+@@ -549,6 +574,7 @@ class Assistant:
+                     elif (self.allow_local_calculation and not image_payloads
+                             and callable(getattr(self.engine, 'answer_with_delivery', None))):
+                         answer, delivery = self.engine.answer_with_delivery(render_prompt(context), cancel)
++                        origin = 'model'
+                         verified_choice = pending_choices.verified_output(context)
+                         if verified_choice is not None:
+                             from .response_delivery import make_receipt
+@@ -558,6 +584,7 @@ class Assistant:
+                     else:
+                         answer = (self.engine.answer_images(render_prompt(context), image_payloads, cancel) if image_payloads
+                                   else self.engine.answer(render_prompt(context), cancel))
++                        origin = 'model'
+                 if cancel and cancel.is_set():
+                     raise EngineError('已停止這次回答。', 'cancelled')
+                 from .prompt_scope import transcription_focus
+@@ -567,8 +594,10 @@ class Assistant:
+                 checks = [] if evidence is not None or literal else check_citations(answer, context['documents']['excerpts'])
+                 if any(not check['range_valid'] for check in checks):
+                     answer += '\n\n來源檢查：有引用無法對照本次文件片段，請勿將該引用視為已驗證。'
+-                mid = answer_runs.finish(self.store, run_id, answer, context, checks,
+-                                         **({'delivery': delivery} if delivery is not None else {}))
++                completion = {'origin': origin} if is_iis_chat(context) else {}
++                if delivery is not None:
++                    completion['delivery'] = delivery
++                mid = answer_runs.finish(self.store, run_id, answer, context, checks, **completion)
+             except Exception as exc:
+                 answer_runs.fail(self.store, run_id, getattr(exc, 'code', 'unexpected_error'))
+                 raise
 diff --git a/assistant/html_chat.py b/assistant/html_chat.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..144582d0290675f5565bd0c2bb8b306f67cf0238
+index 0000000000000000000000000000000000000000..db49cc10455808a5b33915a7c8ce970d62893dfa
 --- /dev/null
 +++ b/assistant/html_chat.py
-@@ -0,0 +1,551 @@
+@@ -0,0 +1,603 @@
 +"""F-drive HTML desktop client for the existing local assistant and 27B runner."""
 +import argparse
 +from contextlib import contextmanager
@@ -328,6 +403,7 @@ index 0000000000000000000000000000000000000000..144582d0290675f5565bd0c2bb8b306f
 +from .local_engine import LocalEngine
 +from .local_models import read_json
 +from .owned_process import windows_process
++from .profile_tone_read import MODE as PROFILE_TONE_MODE
 +from .qwen27_engine import CONTEXT, REPLY_TOKENS, ALIAS, Qwen27Engine
 +from .store import Store
 +from scripts.daily_delivery import WebChatEngine
@@ -341,7 +417,8 @@ index 0000000000000000000000000000000000000000..144582d0290675f5565bd0c2bb8b306f
 +MAX_BODY = 128 * 1024
 +MAX_DRAFT_BODY = 6 * chat_drafts.MAX_CHARS + 256
 +HISTORY_PAGE_SIZE = 100
-+NON_MODEL_REPLIES = {'local_memory', 'local_calculation', 'local_document_calculation', 'local_transcription', 'local_evidence'}
++NON_MODEL_REPLIES = {'local_memory', 'local_calculation', 'local_document_calculation', 'local_transcription',
++                     'local_evidence', PROFILE_TONE_MODE}
 +MODEL_4B = 'qwen3-4b-bf16'
 +MODEL_OPTIONS = {
 +    ALIAS: {'label': 'Qwen3.8-27B BF16', 'context_tokens': CONTEXT,
@@ -355,13 +432,61 @@ index 0000000000000000000000000000000000000000..144582d0290675f5565bd0c2bb8b306f
 +    pass
 +
 +
-+def correction_question(payload):
-+    context = json.loads(payload) if payload else {}
-+    if isinstance(context, dict) and not context.get('image_inputs') and context.get('response_mode') not in NON_MODEL_REPLIES:
++def saved_answer_context(payload):
++    try:
++        context = json.loads(payload) if payload else {}
++    except (ValueError, RecursionError):
++        return {}
++    return context if isinstance(context, dict) else {}
++
++
++def is_local_reply(context):
++    mode = context.get('response_mode')
++    return context.get(answer_runs.ORIGIN_FIELD) == 'local_tool' or (isinstance(mode, str) and mode in NON_MODEL_REPLIES)
++
++
++def correction_question(context):
++    if not context.get('image_inputs') and not is_local_reply(context):
 +        question = context.get('current_request')
 +        if isinstance(question, str) and question.strip():
 +            return question
 +    return None
++
++
++def answer_source(context):
++    if is_local_reply(context):
++        return {'label': '本機工具'}
++    selection = context.get('engine_selection')
++    if not isinstance(selection, dict) or selection.get('runs_on_this_computer') is not True:
++        return {'label': '來源未記錄'}
++    model = selection.get('model')
++    tuning = None
++    details = []
++    if model == 'Qwen3.8-27B' and selection.get('precision') == 'BF16':
++        name = MODEL_OPTIONS[ALIAS]['label']
++        if selection.get('confirmed_batch') is True:
++            batch = selection.get('adapter_batch')
++            tuning = 'LoRA 版本未記錄'
++            if isinstance(batch, str) and re.fullmatch(r'[0-9a-f]{32}', batch):
++                tuning = 'LoRA ' + batch[:8]
++                details.append('LoRA 批次 ' + batch)
++        elif selection.get('confirmed_batch') is False:
++            tuning = '底座'
++    elif model == 'Qwen/Qwen3-4B' and selection.get('kind') == 'local_qwen':
++        name = MODEL_OPTIONS[MODEL_4B]['label']
++        version = selection.get('parameter_version')
++        if version == 'unadapted_base':
++            tuning = '底座'
++        elif isinstance(version, str) and re.fullmatch('[a-z0-9_-]{1,64}', version):
++            tuning = version
++    else:
++        return {'label': '來源未記錄'}
++    revision = selection.get('revision')
++    if isinstance(revision, str) and re.fullmatch(r'[0-9a-f]{40}', revision):
++        details.append('底座版本 ' + revision)
++    prefix = '' if context.get(answer_runs.ORIGIN_FIELD) == 'model' else '當時選用 '
++    suffix = ' · ' + tuning if tuning else ''
++    return {'label': prefix + name + suffix, 'detail': '\n'.join(details)}
 +
 +
 +class ChatApp:
@@ -445,9 +570,11 @@ index 0000000000000000000000000000000000000000..144582d0290675f5565bd0c2bb8b306f
 +            messages = []
 +            for row in reversed(recent[:HISTORY_PAGE_SIZE]):
 +                message = {key: row[key] for key in ('id', 'role', 'content')}
-+                question = correction_question(row['payload']) if row['role'] == 'assistant' else None
-+                if question is not None:
-+                    message.update(correctable=True, question=question[:2000], correction=row['correction'] or '')
++                if row['role'] == 'assistant':
++                    context = saved_answer_context(row['payload'])
++                    message['source'] = answer_source(context)
++                    if (question := correction_question(context)) is not None:
++                        message.update(correctable=True, question=question[:2000], correction=row['correction'] or '')
 +                messages.append(message)
 +            latest = {}
 +            if before is None:
@@ -553,7 +680,7 @@ index 0000000000000000000000000000000000000000..144582d0290675f5565bd0c2bb8b306f
 +                FROM messages m LEFT JOIN answer_contexts c ON c.message_id=m.id
 +                LEFT JOIN feedback f ON f.message_id=m.id LEFT JOIN feedback_versions v ON v.message_id=m.id
 +                WHERE m.id=? AND m.session_id=? AND m.role='assistant' ''', (message_id, sid)).fetchone()
-+        question = correction_question(row['payload']) if row is not None else None
++        question = correction_question(saved_answer_context(row['payload'])) if row is not None else None
 +        if question is None:
 +            raise ValueError('請選擇有原問題快照的助理文字回答。')
 +        matching = []
@@ -2068,10 +2195,10 @@ index 6fd9bc5975fc8b9b18c61959a5d04a55a9b81c6a..81d825c7b75b1e758b66ac41ffdc7c8d
                  raise ValueError("只能評價助理回答。")
 diff --git a/assistant/web_chat/chat.css b/assistant/web_chat/chat.css
 new file mode 100644
-index 0000000000000000000000000000000000000000..bd89649389daa9abc55774e6b29af8c1f1829b49
+index 0000000000000000000000000000000000000000..9e884945496d4f2f98de29e0dab77f8cba671471
 --- /dev/null
 +++ b/assistant/web_chat/chat.css
-@@ -0,0 +1,8 @@
+@@ -0,0 +1,9 @@
 +:root{color-scheme:dark;--bg:#121719;--rail:#0c1113;--panel:#1b2426;--line:#303d3d;--text:#eef2ef;--muted:#9caaa6;--accent:#8be1be;--ink:#082419;font:15px/1.55 "Microsoft JhengHei UI","Segoe UI",sans-serif}
 +*{box-sizing:border-box}body{margin:0;display:grid;grid-template-columns:238px minmax(0,1fr);height:100dvh;color:var(--text);background:var(--bg);overflow:hidden}button,textarea{font:inherit}button{cursor:pointer;color:inherit;background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:8px 13px}button:hover{border-color:var(--muted)}button:focus-visible,textarea:focus-visible{outline:2px solid var(--accent);outline-offset:2px}button:disabled{opacity:.48;cursor:default}button[hidden]{display:none}.primary{background:var(--accent);color:var(--ink);border-color:var(--accent);font-weight:700}.primary:hover{background:#adf0d4;border-color:#adf0d4}
 +.sidebar{padding:20px 14px;background:var(--rail);border-right:1px solid var(--line);display:flex;flex-direction:column;gap:13px;min-height:0}.brand{font-size:17px;font-weight:750;padding:3px 4px 13px;white-space:nowrap}.brand span{color:var(--accent);margin-right:7px}.sidebar nav{overflow:auto;display:flex;flex-direction:column;gap:4px;flex:1}.session{border:0;text-align:left;white-space:nowrap;text-overflow:ellipsis;overflow:hidden;color:var(--muted);background:transparent}.session:hover,.session[aria-current=true]{background:var(--panel);color:var(--text)}.rail-button{text-align:left}.menu-button{display:none}
@@ -2080,12 +2207,13 @@ index 0000000000000000000000000000000000000000..bd89649389daa9abc55774e6b29af8c1
 +.composer{padding:2px max(22px,calc((100% - 820px)/2)) 20px}.composer>p{min-height:1.5em;margin:0 0 4px;color:var(--muted);font-size:.86rem}.composer form{border:1px solid var(--line);border-radius:15px;background:var(--panel);padding:10px}textarea{background:#151d1f;padding:9px;color:var(--text);border:1px solid var(--line);border-radius:8px;resize:vertical;width:100%}.composer textarea{background:transparent;border:0;resize:none;max-height:26vh}.compose-actions,.dialog-actions{display:flex;justify-content:flex-end;align-items:center;gap:8px}.shortcut{color:var(--muted);font-size:.8rem;margin-right:auto}
 +dialog{width:min(600px,calc(100% - 25px));max-height:88dvh;overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px;color:var(--text)}dialog::backdrop{background:#0009}.dialog-title{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}.dialog-title button{font-size:1.25rem;line-height:1;padding:5px 9px}.dialog-title h2{font-size:1.2rem}dialog label{display:block;margin:9px 0 4px}.dialog-status{font-size:.88rem;color:var(--accent);min-height:1.4em}fieldset{border:1px solid var(--line);border-radius:8px;margin:0 0 8px;min-width:0}#examples{max-height:180px;overflow:auto}.example{display:flex;align-items:flex-start;gap:7px;border-bottom:1px solid var(--line);padding:4px 0}.example label{margin:0;flex:1;overflow-wrap:anywhere}.example small{color:var(--muted);display:block}.example .withdraw{font-size:.78rem;padding:3px 5px}.candidate{display:flex;align-items:center;justify-content:space-between;gap:6px;padding:6px 0;border-top:1px solid var(--line);overflow-wrap:anywhere}.candidate button{flex-shrink:0}.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
 +@media(max-width:720px){body{grid-template-columns:1fr}.sidebar{display:none;position:fixed;inset:0 auto 0 0;width:min(260px,75%);z-index:2;box-shadow:12px 0 30px #0008}.sidebar.open{display:flex}.menu-button{display:inline-flex}.history{padding-inline:14px}.composer{padding-inline:14px}header{padding-inline:14px}}
++.message-source summary{cursor:pointer}.source-detail{margin:0 0 7px;color:var(--muted);font-size:.78rem;white-space:pre-wrap;overflow-wrap:anywhere}
 diff --git a/assistant/web_chat/chat.js b/assistant/web_chat/chat.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..ffd1fb3b6791621436e6f81b9a29be61437da1f2
+index 0000000000000000000000000000000000000000..89000373fa07f6e41274f34ccbb47285418dd93d
 --- /dev/null
 +++ b/assistant/web_chat/chat.js
-@@ -0,0 +1,236 @@
+@@ -0,0 +1,244 @@
 +'use strict';
 +const $ = id => document.getElementById(id);
 +const fragment = new URLSearchParams(location.hash.slice(1));
@@ -2135,7 +2263,15 @@ index 0000000000000000000000000000000000000000..ffd1fb3b6791621436e6f81b9a29be61
 +}
 +function showMessage(row) {
 +  const article = element('article', undefined, 'message ' + row.role);
-+  article.append(element('div', row.role === 'user' ? '你' : '助理', 'speaker'));
++  const name = row.role === 'user' ? '你' : '助理';
++  const label = row.source?.label ? name + ' · ' + row.source.label : name;
++  if (row.source?.detail) {
++    const source = element('details', undefined, 'message-source');
++    source.append(element('summary', label, 'speaker'), element('div', row.source.detail, 'source-detail'));
++    article.append(source);
++  } else {
++    article.append(element('div', label, 'speaker'));
++  }
 +  article.append(element('p', row.content));
 +  if (row.correctable) {
 +    article.append(action('更正這則回答', () => {
@@ -2777,10 +2913,10 @@ index 7b43f429b175b8c9e62936b7121a9327e18f4acf..627e022f6948211497f09e406b578869
      # another process may already have an open handle to the same file.
 diff --git a/tests/test_html_chat.py b/tests/test_html_chat.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..c31e15c0af8de054a7dfcd3d8ee9c7df1cdc1d2a
+index 0000000000000000000000000000000000000000..11ec9b14b7cca69f07e9feae18f988a9e8a366a5
 --- /dev/null
 +++ b/tests/test_html_chat.py
-@@ -0,0 +1,833 @@
+@@ -0,0 +1,882 @@
 +from contextlib import contextmanager, nullcontext
 +import json
 +import os
@@ -3292,6 +3428,55 @@ index 0000000000000000000000000000000000000000..c31e15c0af8de054a7dfcd3d8ee9c7df
 +                reopened.dispatch('retry', body)
 +        finally:
 +            reopened.change_mode('off')
++
++    def test_answer_source_is_pinned_to_the_completed_reply_and_survives_restore(self):
++        app = ChatApp(self.store)
++        batch = 'ae13a7be' + '0' * 24
++        selection_27b = {'runs_on_this_computer': True, 'model': 'Qwen3.8-27B', 'precision': 'BF16',
++                         'revision': 'a' * 40, 'confirmed_batch': True, 'adapter_batch': batch}
++        with patch.object(app.engine, 'describe', return_value=selection_27b), patch.object(
++                app.engine, 'answer', return_value='甲') as first_model:
++            first = app.driver.ask(self.sid, '請用一個字猜這張測試卡的內容。')
++        self.assertNotIn(answer_runs.ORIGIN_FIELD, first_model.call_args.args[0])
++        legacy = self.store.add_answer(self.sid, '舊紀錄', {'engine_selection': selection_27b, 'current_request': '舊問題'})
++        unknown = self.store.add_message(self.sid, 'assistant', '未保存來源的舊回答')
++
++        class Smaller(FakeQwen):
++            display_name = 'Qwen3-4B BF16'
++            python = Path(sys.executable)
++
++            def describe(self):
++                return {'runs_on_this_computer': True, 'kind': 'local_qwen', 'model': 'Qwen/Qwen3-4B',
++                        'revision': 'b' * 40, 'parameter_version': 'unadapted_base'}
++
++        with patch('assistant.html_chat.LocalEngine', Smaller):
++            app.dispatch('select', {'model': MODEL_4B})
++            second = app.driver.ask(self.sid, '請用一個字猜另一張卡片的內容。')
++            with patch.object(app.engine, 'answer') as forbidden:
++                computed = app.driver.ask(self.sid, '請計算：17+26，只輸出精確值。')
++                forbidden.assert_not_called()
++        rows = {item['id']: item for item in app.view(self.sid)['messages'] if item['role'] == 'assistant'}
++        self.assertEqual(rows[first['id']]['source']['label'], 'Qwen3.8-27B BF16 · LoRA ae13a7be')
++        self.assertIn(batch, rows[first['id']]['source']['detail'])
++        self.assertIn(selection_27b['revision'], rows[first['id']]['source']['detail'])
++        self.assertEqual(rows[legacy]['source']['label'], '當時選用 Qwen3.8-27B BF16 · LoRA ae13a7be')
++        self.assertEqual(rows[unknown]['source']['label'], '來源未記錄')
++        self.assertEqual(rows[second['id']]['source']['label'], 'Qwen3-4B BF16 · 底座')
++        self.assertEqual(rows[computed['id']]['source']['label'], '本機工具')
++        self.assertNotIn('correctable', rows[computed['id']])
++        self.assertEqual(app.history_page(self.sid, before=second['id'])['messages'][1]['source'],
++                         rows[first['id']]['source'])
++        recorded = self.store.answer_context(first['id'])
++        self.assertEqual(recorded[answer_runs.ORIGIN_FIELD], 'model')
++        self.assertNotIn(answer_runs.ORIGIN_FIELD, ''.join(render_prompt_parts(recorded)))
++
++        archive = create_backup(self.store.path)
++        restored_folder = self.store.path.parent / 'restored'
++        restore_backup(archive['path'], restored_folder)
++        reopened = ChatApp(Store(restored_folder / 'assistant.sqlite3'))
++        self.assertEqual(reopened.mode, 'off')
++        self.assertEqual({item['id']: item['source'] for item in reopened.view(self.sid)['messages']
++                          if item['role'] == 'assistant'}, {mid: row['source'] for mid, row in rows.items()})
 +
 +    def test_web_prompt_keeps_context_and_uses_the_current_local_product_guidance(self):
 +        self.store.add_message(self.sid, 'assistant', '舊版說明：預設引擎是 Codex。')

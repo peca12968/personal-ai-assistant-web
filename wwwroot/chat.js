@@ -183,7 +183,15 @@ function busyState() {
 }
 function messageNode(row, sourceSid, retry = null) {
   const article = element('article', undefined, 'message ' + row.role);
-  article.append(element('div', row.role === 'user' ? '你' : '助理', 'speaker'));
+  const name = row.role === 'user' ? '你' : '助理';
+  const label = row.source?.label ? name + ' · ' + row.source.label : name;
+  if (row.source?.detail) {
+    const source = element('details', undefined, 'message-source');
+    source.append(element('summary', label, 'speaker'), element('div', row.source.detail, 'source-detail'));
+    article.append(source);
+  } else {
+    article.append(element('div', label, 'speaker'));
+  }
   article.append(element('p', row.content));
   if (retry && row.role === 'user' && row.id === retry.user_message_id) {
     const reason = {cancelled: '回答已停止', interrupted: '回答曾中斷', failed: '回答未完成'}[retry.status];
