@@ -448,10 +448,10 @@ index 78bfad433d1abe8c476e44d04bc20f8b5c167020..a96dfd9638c9157c10c256798bad45e1
                  "excerpt_ids": [row["message_id"] for row in context["earlier_user_excerpts"]],
 diff --git a/assistant/html_chat.py b/assistant/html_chat.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..1a164ed54de37b125c989126ddf22e8f7527e7c7
+index 0000000000000000000000000000000000000000..43ed701c1d5931462a78f8562d5cd10a2d9ca562
 --- /dev/null
 +++ b/assistant/html_chat.py
-@@ -0,0 +1,620 @@
+@@ -0,0 +1,624 @@
 +"""F-drive HTML desktop client for the existing local assistant and 27B runner."""
 +import argparse
 +from contextlib import contextmanager
@@ -747,6 +747,10 @@ index 0000000000000000000000000000000000000000..1a164ed54de37b125c989126ddf22e8f
 +        with self.guard:
 +            state = {**self.job, 'mode': self.mode, 'selection': self.model_state()}
 +            pending = self.draft_job
++            if state.get('running') and state['stage'] == 'chat_loading' and self.model_task is not None:
++                with self.model_task.lock:
++                    if self.model_task.load_percent is not None:
++                        state['load_percent'] = self.model_task.load_percent
 +        if pending is not None and state.get('id') == pending[0] and state.get('draft_submitted') is not True:
 +            _, sid, draft = pending
 +            try:
@@ -1621,12 +1625,14 @@ index 0000000000000000000000000000000000000000..e4eb5a10dc46324b1b090f690f31e8a7
 +        api.CloseHandle(job)
 diff --git a/assistant/qwen27_engine.py b/assistant/qwen27_engine.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..d501a71847583cc4daaceebe29576be148e770ef
+index 0000000000000000000000000000000000000000..5d1a1f67b14befd51f116d3263565173e3565e1a
 --- /dev/null
 +++ b/assistant/qwen27_engine.py
-@@ -0,0 +1,282 @@
+@@ -0,0 +1,321 @@
 +"""Loopback-only CUDA llama.cpp inference for verified Qwen3.8-27B GGUF weights."""
 +from contextlib import contextmanager, ExitStack
++from contextvars import copy_context
++from http.client import HTTPException
 +import json
 +import os
 +from pathlib import Path
@@ -1635,7 +1641,7 @@ index 0000000000000000000000000000000000000000..d501a71847583cc4daaceebe29576be1
 +import socket
 +import subprocess
 +from tempfile import TemporaryFile
-+from threading import Thread
++from threading import Event, Thread
 +import time
 +from urllib.error import HTTPError, URLError
 +from urllib.request import ProxyHandler, Request, build_opener
@@ -1644,7 +1650,7 @@ index 0000000000000000000000000000000000000000..d501a71847583cc4daaceebe29576be1
 +from . import local_chat_budget, local_models
 +from .local_worker import SYSTEM_GUIDANCE
 +from .owned_process import windows_process
-+from scripts.learning.runtime import gpu_lease, report_chat_stage, report_chat_usage, require_web_model
++from scripts.learning.runtime import gpu_lease, report_chat_load, report_chat_stage, report_chat_usage, require_web_model
 +
 +
 +ASSETS = ROOT / 'data/learning/experiments/qwen38-bf16-rtx5080'
@@ -1736,15 +1742,47 @@ index 0000000000000000000000000000000000000000..d501a71847583cc4daaceebe29576be1
 +        self.cancel, self.deadline = cancel, deadline
 +        self.alias, self.context = alias, context
 +
-+    def request(self, path, body=None, *, timeout=900):
++    def open_response(self, path, body=None, *, timeout):
 +        data = json.dumps(body, ensure_ascii=False).encode('utf-8') if body is not None else None
 +        call = Request(self.address + path, data=data,
 +                       headers={'Authorization': 'Bearer ' + self.key, 'Content-Type': 'application/json'})
-+        with build_opener(ProxyHandler({})).open(call, timeout=timeout) as stream:
++        return build_opener(ProxyHandler({})).open(call, timeout=timeout)
++
++    def request(self, path, body=None, *, timeout=900):
++        with self.open_response(path, body, timeout=timeout) as stream:
 +            data = stream.read(2 * 1024 * 1024 + 1)
 +        if len(data) > 2 * 1024 * 1024:
 +            raise ValueError('CUDA 伺服器回覆超出大小上限。')
 +        return json.loads(data)
++
++    def watch_loading(self, stop):
++        while not stop.is_set() and self.process.poll() is None:
++            try:
++                with self.open_response('/models/sse', timeout=2) as stream:
++                    if stream.headers.get_content_type() != 'text/event-stream':
++                        return
++                    while not stop.is_set():
++                        line = stream.readline(32769)
++                        if not line or len(line) > 32768 or stop.is_set():
++                            break
++                        if not line.startswith(b'data: '):
++                            continue
++                        event = json.loads(line[6:])
++                        if event.get('event') != 'status_change' or event.get('model') != self.alias:
++                            continue
++                        data = event.get('data', {})
++                        if data.get('status') in ('loaded', 'unloaded'):
++                            return
++                        progress = data.get('progress', {})
++                        if data.get('status') == 'loading' and progress.get('current') == 'text_model':
++                            report_chat_load(progress.get('value'))
++            except HTTPError as exc:
++                exc.close()
++                if exc.code != 503:
++                    return
++            except (OSError, HTTPException, ValueError, AttributeError, RecursionError):
++                pass
++            stop.wait(0.3)
 +
 +    def query(self, path, body):
 +        result = Queue(maxsize=1)
@@ -1871,9 +1909,13 @@ index 0000000000000000000000000000000000000000..d501a71847583cc4daaceebe29576be1
 +                report_chat_stage('chat_launch')
 +                process = stack.enter_context(windows_process(command, cwd=self.executable.parent,
 +                    env={**os.environ, 'CUDA_CACHE_PATH': str(cache)}, stdin=subprocess.DEVNULL, stdout=log, stderr=log))
-+                report_chat_stage('chat_loading')
++                monitor_loading = report_chat_stage('chat_loading')
 +                server = LlamaSession(f'http://127.0.0.1:{port}', key, process, cancel, deadline,
 +                                      alias=self.alias, context=self.context)
++                stop_watching = Event()
++                if monitor_loading:
++                    stack.callback(stop_watching.set)
++                    Thread(target=copy_context().run, args=(server.watch_loading, stop_watching), daemon=True).start()
 +                while True:
 +                    check_running(cancel, deadline)
 +                    if process.poll() is not None:
@@ -1887,6 +1929,7 @@ index 0000000000000000000000000000000000000000..d501a71847583cc4daaceebe29576be1
 +                    except (HTTPError, URLError, TimeoutError):
 +                        pass
 +                    time.sleep(0.15)
++                stop_watching.set()
 +                yield server
 +                check_running(cancel, deadline)
 +                self.verify()
@@ -3012,10 +3055,10 @@ index 0000000000000000000000000000000000000000..708b4fc31bc3749e36fd5fbae10da8d7
 +    with web_model_task('training'):
 +        fit(folder)
 diff --git a/scripts/learning/runtime.py b/scripts/learning/runtime.py
-index 7b43f429b175b8c9e62936b7121a9327e18f4acf..2dd19b9f433489d908716f1a6382625496be03d1 100644
+index 7b43f429b175b8c9e62936b7121a9327e18f4acf..c65f42afff30fcb3fd68724a6cf05f43cdd4b10c 100644
 --- a/scripts/learning/runtime.py
 +++ b/scripts/learning/runtime.py
-@@ -1,14 +1,187 @@
+@@ -1,14 +1,201 @@
 -"""Process-held advisory GPU lease; a leftover file never proves a live owner."""
 +"""Web-authorized model tasks and process-held advisory GPU leases."""
 +from contextvars import ContextVar
@@ -3060,6 +3103,7 @@ index 7b43f429b175b8c9e62936b7121a9327e18f4acf..2dd19b9f433489d908716f1a63826254
 +        self.terminators = set()
 +        self.phase_starts = [('queued', time.monotonic())]
 +        self.stop_requested = None
++        self.load_percent = None
 +
 +    @contextmanager
 +    def activate(self):
@@ -3096,8 +3140,21 @@ index 7b43f429b175b8c9e62936b7121a9327e18f4acf..2dd19b9f433489d908716f1a63826254
 +        if task.cancel.is_set() or task.phase_starts[-1][0] == stage:
 +            return
 +        task.phase_starts.append((stage, time.monotonic()))
++        task.load_percent = None
 +    if task.on_progress is not None:
 +        task.on_progress(stage)
++    return True
++
++
++def report_chat_load(fraction):
++    task = _WEB_TASK.get()
++    if task is None or task.mode != 'chat' or type(fraction) not in (int, float) or not 0 <= fraction <= 1:
++        return
++    percent = int(fraction * 100)
++    with task.lock:
++        if not task.cancel.is_set() and task.phase_starts[-1][0] == 'chat_loading':
++            if task.load_percent is None or percent > task.load_percent:
++                task.load_percent = percent
 +
 +
 +def chat_timing():
@@ -3237,12 +3294,13 @@ index 0000000000000000000000000000000000000000..8549526f87a4b6d9733661156bf49c52
 +    print(verify())
 diff --git a/tests/test_html_chat.py b/tests/test_html_chat.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..c05fd20a5b348d70f6b698b20ef2a8212cd9d860
+index 0000000000000000000000000000000000000000..0e8a60fc052a169901785e5bcb07999cb0530afd
 --- /dev/null
 +++ b/tests/test_html_chat.py
-@@ -0,0 +1,1065 @@
+@@ -0,0 +1,1118 @@
 +from contextlib import contextmanager, nullcontext
 +import hashlib
++from io import BytesIO
 +import json
 +import os
 +from pathlib import Path
@@ -3551,6 +3609,58 @@ index 0000000000000000000000000000000000000000..c05fd20a5b348d70f6b698b20ef2a821
 +        self.assertIn(f'{limit + 37:,} tokens', str(caught.exception))
 +        self.assertIn(f'{limit:,} tokens', str(caught.exception))
 +        self.assertEqual(calls.call_count, 2)
++
++    def test_27b_load_progress_uses_bound_server_events_and_clears_after_readiness(self):
++        root = self.store.path.parent
++        executable, weights = root / 'synthetic.exe', root / 'synthetic.gguf'
++        executable.touch()
++        weights.touch()
++        seen, ready = Event(), Event()
++
++        def frame(value, *, model=ALIAS, current='text_model', status='loading'):
++            return b'data: ' + json.dumps({'event': 'status_change', 'model': model, 'data': {
++                'status': status, 'progress': {'current': current, 'value': value},
++            }}).encode() + b'\n\n'
++
++        class Stream(BytesIO):
++            headers = SimpleNamespace(get_content_type=lambda: 'text/event-stream')
++
++            def readline(self, limit):
++                line = super().readline(limit)
++                if b'"status": "loaded"' in line:
++                    seen.set()
++                return line
++
++        stream = Stream(frame(0.379) + frame(0.27) + frame(0.99, model='another-model') +
++                        frame(0.99, current='mmproj_model') + frame(True) + frame(0, status='loaded'))
++        process = Mock()
++        process.poll.return_value = None
++        response = {'choices': [{'finish_reason': 'stop', 'message': {'content': '甲'}}],
++                    'usage': {'prompt_tokens': 2, 'completion_tokens': 1}}
++        with (
++            patch('assistant.html_chat.Qwen27Engine', Qwen27Engine),
++            patch('assistant.qwen27_engine.model_assets', return_value=(executable, weights)),
++            patch('assistant.qwen27_engine.ASSETS', root),
++            patch('assistant.qwen27_engine.gpu_lease', return_value=nullcontext()),
++            patch('assistant.qwen27_engine.windows_process', return_value=nullcontext(process)),
++            patch.object(LlamaSession, 'open_response', return_value=stream) as open_events,
++            patch.object(LlamaSession, 'request', side_effect=lambda *a, **kw: {'status': 'ok' if ready.is_set() else 'loading'}),
++            patch.object(LlamaSession, 'query', side_effect=[{'prompt': 'mock'}, {'tokens': [1, 2]}, response]),
++        ):
++            app = ChatApp(self.store, controlled=True)
++            app.change_mode('chat')
++            app.dispatch('ask', {'sid': self.sid, 'question': '請回答甲。'})
++            try:
++                self.assertTrue(seen.wait(3))
++                live = app.status()
++                self.assertEqual((live['stage'], live['load_percent']), ('chat_loading', 37))
++                open_events.assert_called_once_with('/models/sse', timeout=2)
++            finally:
++                ready.set()
++                app.worker.join(timeout=3)
++            self.assertEqual(app.status()['stage'], 'done')
++            self.assertNotIn('load_percent', app.status())
++            app.change_mode('off')
 +
 +    def test_q8_requires_a_verified_asset_and_disables_it_after_file_changes(self):
 +        root = self.store.path.parent

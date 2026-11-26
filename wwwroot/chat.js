@@ -176,7 +176,9 @@ function busyState() {
   timer.hidden = !(job?.running && job.kind === 'chat' &&
     Number.isFinite(job.stage_started_at) && Number.isFinite(job.started_at));
   if (!timer.hidden) {
-    timer.textContent = '本階段 ' + elapsedText(job.stage_started_at) + ' · 本輪共 ' + elapsedText(job.started_at);
+    const load = job.stage === 'chat_loading' && Number.isInteger(job.load_percent) &&
+      job.load_percent >= 0 && job.load_percent <= 100 ? `權重載入 ${job.load_percent}% · ` : '';
+    timer.textContent = load + '本階段 ' + elapsedText(job.stage_started_at) + ' · 本輪共 ' + elapsedText(job.started_at);
   } else {
     timer.textContent = '';
   }
