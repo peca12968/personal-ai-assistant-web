@@ -259,10 +259,10 @@ index 78bfad433d1abe8c476e44d04bc20f8b5c167020..d9f3d9bcf020ef3cd7cc5725585095ae
      def _ask(self, sid, question, cancel=None, retry=None, draft=None, image_ids=()):
 diff --git a/assistant/html_chat.py b/assistant/html_chat.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..ff5bd465fb42981ee055415e1e8a0991d72876b2
+index 0000000000000000000000000000000000000000..144582d0290675f5565bd0c2bb8b306f67cf0238
 --- /dev/null
 +++ b/assistant/html_chat.py
-@@ -0,0 +1,543 @@
+@@ -0,0 +1,551 @@
 +"""F-drive HTML desktop client for the existing local assistant and 27B runner."""
 +import argparse
 +from contextlib import contextmanager
@@ -440,8 +440,9 @@ index 0000000000000000000000000000000000000000..ff5bd465fb42981ee055415e1e8a0991
 +            if self.job.get('running'):
 +                raise ValueError('目前正在處理本機工作。可先按停止，等程序退出再操作。')
 +            self.cancel = Event()
-+            task = self.model_task = WebModelTask(mode, self.cancel)
-+            job = {'id': job_id or uuid.uuid4().hex, 'kind': kind, 'running': True, 'stage': 'queued'}
++            started = time.time()
++            job = {'id': job_id or uuid.uuid4().hex, 'kind': kind, 'running': True, 'stage': 'queued',
++                   'started_at': started, 'stage_started_at': started}
 +            if sid is not None:
 +                job['sid'] = sid
 +            self.job = job
@@ -449,7 +450,10 @@ index 0000000000000000000000000000000000000000..ff5bd465fb42981ee055415e1e8a0991
 +
 +            def progress(stage):
 +                with self.guard:
-+                    job['stage'] = stage
++                    if job['stage'] != stage:
++                        job.update(stage=stage, stage_started_at=time.time())
++
++            task = self.model_task = WebModelTask(mode, self.cancel, on_progress=progress)
 +
 +            def run():
 +                stage, error = 'failed', '本機背景工作中斷。'
@@ -471,7 +475,7 @@ index 0000000000000000000000000000000000000000..ff5bd465fb42981ee055415e1e8a0991
 +                    with self.guard:
 +                        if draft is not None:
 +                            job['draft_submitted'] = committed
-+                        job.update(stage=stage, running=False, error=error)
++                        job.update(last_active_stage=job['stage'], stage=stage, running=False, error=error)
 +
 +            self.worker = Thread(target=run, daemon=True)
 +            try:
@@ -550,8 +554,10 @@ index 0000000000000000000000000000000000000000..ff5bd465fb42981ee055415e1e8a0991
 +                item = learning_queue.observed(self.store, db, learning_queue.decode(record))
 +                if item['readiness'] == 'ready':
 +                    examples.append({key: item[key] for key in ('id', 'prompt', 'revision', 'status')})
-+        return {'examples': examples, 'jobs': qwen27_learning.recent_jobs(self.store.path.parent),
-+                'active': self.batch}
++        with self.guard:
++            active = self.batch
++        return {'examples': examples, 'jobs': qwen27_learning.recent_jobs(self.store, active=active),
++                'active': active}
 +
 +    def change_mode(self, requested):
 +        if not self.controlled or requested not in ('off', 'chat', 'training'):
@@ -622,6 +628,8 @@ index 0000000000000000000000000000000000000000..ff5bd465fb42981ee055415e1e8a0991
 +                    raise ValueError('其他分頁已變更模型。請核對頁首後再送出。')
 +                sid = body['sid']
 +                self.require_session(sid)
++                if self.batch is not None:
++                    qwen27_learning.available_candidate(self.store, self.batch)
 +                question = body.get('question')
 +                submission = None
 +                expected_run = None
@@ -641,7 +649,7 @@ index 0000000000000000000000000000000000000000..ff5bd465fb42981ee055415e1e8a0991
 +                driver = self.driver
 +
 +                def answer(cancel, progress):
-+                    progress('answering')
++                    progress('chat_context')
 +                    if route == 'ask':
 +                        return driver.ask(sid, question, cancel, draft=submission)
 +                    return driver.retry(sid, cancel, expected_run_id=expected_run)
@@ -881,7 +889,7 @@ index d7493f3dc1a97a0185afae16d6019af6c85ac21d..9416c8b185754d47e47a51072d75c1ce
          if item_id is not None:
              old = latest(db, item_id)
 diff --git a/assistant/local_engine.py b/assistant/local_engine.py
-index 74b637aa504ab3ff28540d4015e58db08b7af365..7eb88f9278a9ab09348c8fde39b73c7c6082c7bc 100644
+index 74b637aa504ab3ff28540d4015e58db08b7af365..96d78f87202bc3b672dd80c077558bd8cf6628bf 100644
 --- a/assistant/local_engine.py
 +++ b/assistant/local_engine.py
 @@ -1,4 +1,5 @@
@@ -895,7 +903,7 @@ index 74b637aa504ab3ff28540d4015e58db08b7af365..7eb88f9278a9ab09348c8fde39b73c7c
  from . import document_partial, local_chat_budget, local_models, learned_models
  from .learning_batches import PhaseExit
 +from .owned_process import windows_process
-+from scripts.learning.runtime import model_launch_ticket, require_web_model
++from scripts.learning.runtime import model_launch_ticket, report_chat_stage, require_web_model
  
  ERRORS = {
 +    'web_power_required': '請從 IIS 包含使用模型開關的網頁送出本機工作。',
@@ -919,16 +927,17 @@ index 74b637aa504ab3ff28540d4015e58db08b7af365..7eb88f9278a9ab09348c8fde39b73c7c
          self.workdir = Path(data_dir).resolve()/'local-engine-workspace'
          self.workdir.mkdir(parents=True, exist_ok=True)
          folder = local_models.ROOT/'data/learning/runtime'
-@@ -80,6 +85,8 @@ class LocalEngine:
+@@ -80,6 +85,9 @@ class LocalEngine:
          return self._answer({'schema': 'local_inference_request_v2', 'guide': guide, 'data': data}, (guide, data), cancel)[0]
  
      def _answer(self, payload, texts, cancel):
 +        if self.web_owned:
 +            require_web_model('chat')
++            report_chat_stage('chat_checking')
          deadline = time.monotonic() + self.timeout
          def check():
              if cancel and cancel.is_set():
-@@ -113,14 +120,36 @@ class LocalEngine:
+@@ -113,14 +121,47 @@ class LocalEngine:
                      source.write(request); source.seek(0)
                      command = self.command(output)
                      check()
@@ -944,6 +953,7 @@ index 74b637aa504ab3ff28540d4015e58db08b7af365..7eb88f9278a9ab09348c8fde39b73c7c
 +                        if self.web_owned:
 +                            proof = owned.enter_context(model_launch_ticket(folder, 'chat'))
 +                            options['env'] = {**os.environ, local_models.CHAT_ADMISSION_ENV: proof}
++                            report_chat_stage('chat_launch')
 +                            process = owned.enter_context(windows_process(command, **options))
 +                        else:
 +                            process = subprocess.Popen(command, **options,
@@ -964,14 +974,24 @@ index 74b637aa504ab3ff28540d4015e58db08b7af365..7eb88f9278a9ab09348c8fde39b73c7c
 +
 +                            owned.callback(finish)
                          last_check=0
++                        last_stage = None
                          while process.poll() is None:
 -                            actual.observe()
 +                            if actual is not None:
 +                                actual.observe()
++                            if self.web_owned:
++                                try:
++                                    with output.with_suffix('.stage').open(encoding='ascii') as stream:
++                                        stage = stream.read(64).strip()
++                                except (OSError, UnicodeError):
++                                    stage = None
++                                if stage and stage != last_stage:
++                                    report_chat_stage(stage)
++                                    last_stage = stage
                              check()
                              if time.monotonic()-last_check>=2:
                                  verify_selection(); last_check=time.monotonic()
-@@ -175,14 +204,5 @@ class LocalEngine:
+@@ -175,14 +216,5 @@ class LocalEngine:
                              return delivered, make_receipt(raw, delivered, method=document_partial.METHOD)
                          except (ValueError, RecursionError):
                              raise EngineError(ERRORS['document_partial_invalid'], 'local_document_partial_invalid') from None
@@ -999,7 +1019,7 @@ index 95d4b09e6405308b97343e629f215e04c9a36099..b4480ceafe994e0237a8cb118c1dcaa0
  
  def read_json(path, limit=2 * 1024 * 1024):
 diff --git a/assistant/local_worker.py b/assistant/local_worker.py
-index 1daa8db46c428a0cd0951492d63209e4fc4cccbd..57882356f1a8100be50e55fe3082b96303db8469 100644
+index 1daa8db46c428a0cd0951492d63209e4fc4cccbd..ea1ce5acf19d0f6ae1e7e0ed8e96ecda51bb3220 100644
 --- a/assistant/local_worker.py
 +++ b/assistant/local_worker.py
 @@ -11,7 +11,8 @@ if __package__ in (None, ''):
@@ -1008,7 +1028,7 @@ index 1daa8db46c428a0cd0951492d63209e4fc4cccbd..57882356f1a8100be50e55fe3082b963
  from assistant import document_partial, local_chat_budget
 -from scripts.learning.runtime import gpu_lease
 +from scripts.learning.runtime import (ModelPowerRequired, consume_model_launch_ticket, gpu_lease,
-+                                      require_web_model, web_model_task)
++                                      report_chat_stage, require_web_model, web_model_task)
  from scripts.learning.protocol import EXPECTED_VERSIONS
  
  SYSTEM_GUIDANCE = (
@@ -1023,15 +1043,57 @@ index 1daa8db46c428a0cd0951492d63209e4fc4cccbd..57882356f1a8100be50e55fe3082b963
      os.environ['HF_HOME'] = str(local_models.ROOT/'data/learning/huggingface')
      os.environ['HF_HUB_OFFLINE'] = '1'
      os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
-@@ -203,6 +208,7 @@ def main():
+@@ -125,12 +130,15 @@ def infer(request):
+         torch.set_num_threads(8)
+         torch.manual_seed(20261104)
+         torch.cuda.set_per_process_memory_fraction(0.85)
++        report_chat_stage('chat_assets')
+         try:
+             base, adapter = learned_models.verify_assets(request['selection'])
+         except (OSError, ValueError, KeyError, TypeError, learned_models.sqlite3.Error):
+             raise Failure('model_changed') from None
++        report_chat_stage('chat_tokenizing')
+         tokenizer = AutoTokenizer.from_pretrained(base, local_files_only=True, trust_remote_code=False)
+         ids, excerpts, partial = _encode_request(tokenizer, request, request_messages(request))
++        report_chat_stage('chat_loading')
+         model = AutoModelForCausalLM.from_pretrained(base, local_files_only=True, trust_remote_code=False,
+             use_safetensors=True, torch_dtype=torch.bfloat16, device_map={'': 0}, attn_implementation='sdpa')
+         if adapter is not None:
+@@ -141,6 +149,7 @@ def infer(request):
+                     raise Failure('model_changed')
+         model.eval()
+         gc.collect(); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
++        report_chat_stage('chat_prefill')
+         tokens = torch.tensor([ids], device='cuda')
+         with torch.inference_mode():
+             # Reuse the same key/value buffers across chunks and decoding steps.
+@@ -157,6 +166,7 @@ def infer(request):
+                 if cache.get_seq_length() != end:
+                     raise Failure('inference_failed')
+                 del prefill
++            report_chat_stage('chat_generating')
+             output = model.generate(input_ids=tokens, attention_mask=torch.ones_like(tokens),
+                 past_key_values=cache, max_new_tokens=local_models.MAX_OUTPUT_TOKENS,
+                 disable_compile=True, do_sample=False, pad_token_id=tokenizer.eos_token_id, eos_token_id=tokenizer.eos_token_id,
+@@ -203,6 +213,17 @@ def main():
      parser = argparse.ArgumentParser()
      parser.add_argument('--output', type=Path, required=True)
      args = parser.parse_args()
 +    proof = os.environ.pop(local_models.CHAT_ADMISSION_ENV, '')
++    stage_path = args.output.with_suffix('.stage')
++
++    def publish_stage(stage):
++        temporary = stage_path.with_suffix('.stage.tmp')
++        try:
++            temporary.write_text(stage + '\n', encoding='ascii')
++            os.replace(temporary, stage_path)
++        except OSError:
++            pass  # Progress is optional if a short-lived reader holds the file.
++
      with args.output.with_suffix('.started').open('x',encoding='ascii') as marker:
          marker.write(str(os.getpid()))
      code = 0
-@@ -214,7 +220,12 @@ def main():
+@@ -214,7 +235,13 @@ def main():
              request = json.loads(payload.decode('utf-8'))
          except (UnicodeError, ValueError):
              raise Failure('invalid_request') from None
@@ -1040,7 +1102,8 @@ index 1daa8db46c428a0cd0951492d63209e4fc4cccbd..57882356f1a8100be50e55fe3082b963
 +            consume_model_launch_ticket(args.output.parent, 'chat', proof)
 +        except ModelPowerRequired:
 +            raise Failure('web_power_required') from None
-+        with web_model_task('chat'):
++        with web_model_task('chat', on_progress=publish_stage):
++            report_chat_stage('chat_runtime')
 +            result = infer(request)
      except Failure as exc:
          result = {'schema': 'local_inference_result_v1', 'status': 'failed', 'code': exc.code}
@@ -1163,10 +1226,10 @@ index 0000000000000000000000000000000000000000..e4eb5a10dc46324b1b090f690f31e8a7
 +        api.CloseHandle(job)
 diff --git a/assistant/qwen27_engine.py b/assistant/qwen27_engine.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..3f3b3740dbc866d51ec061de02044cebc2cfe662
+index 0000000000000000000000000000000000000000..c1c46bc931d520cbd8541bb0c2daa0b3e4f2c2d3
 --- /dev/null
 +++ b/assistant/qwen27_engine.py
-@@ -0,0 +1,234 @@
+@@ -0,0 +1,239 @@
 +"""Loopback-only CUDA llama.cpp inference for the verified Qwen3.8-27B GGUF."""
 +from contextlib import contextmanager, ExitStack
 +import json
@@ -1186,7 +1249,7 @@ index 0000000000000000000000000000000000000000..3f3b3740dbc866d51ec061de02044ceb
 +from . import local_chat_budget
 +from .local_worker import SYSTEM_GUIDANCE
 +from .owned_process import windows_process
-+from scripts.learning.runtime import gpu_lease, require_web_model
++from scripts.learning.runtime import gpu_lease, report_chat_stage, require_web_model
 +
 +
 +ASSETS = ROOT / 'data/learning/experiments/qwen38-bf16-rtx5080'
@@ -1290,11 +1353,13 @@ index 0000000000000000000000000000000000000000..3f3b3740dbc866d51ec061de02044ceb
 +            return value
 +
 +    def answer(self, messages, *, max_tokens=REPLY_TOKENS):
++        report_chat_stage('chat_tokenizing')
 +        body = {'model': ALIAS, 'messages': messages, **THINKING}
 +        formatted = self.query('/apply-template', body)['prompt']
 +        tokens = self.query('/tokenize', {'content': formatted, 'parse_special': True, 'add_special': True})['tokens']
 +        if not 1 <= len(tokens) <= CONTEXT - max_tokens - 4:
 +            raise EngineError(f'27B 的 {CONTEXT} token 上下文容納不了完整輸入與回答，請縮短本輪內容。', 'local_input_too_large')
++        report_chat_stage('chat_completing')
 +        output = self.query('/v1/chat/completions', {**body, **generation_settings(max_tokens)})
 +        choice, = output['choices']
 +        if choice['finish_reason'] == 'length':
@@ -1343,6 +1408,7 @@ index 0000000000000000000000000000000000000000..3f3b3740dbc866d51ec061de02044ceb
 +        require_web_model('chat', 'training')
 +        deadline = time.monotonic() + self.timeout
 +        check_running(cancel, deadline)
++        report_chat_stage('chat_checking')
 +        self.verify()
 +        with ExitStack() as stack:
 +            try:
@@ -1365,8 +1431,10 @@ index 0000000000000000000000000000000000000000..3f3b3740dbc866d51ec061de02044ceb
 +                command += ['--lora', str(adapter)]
 +            log = stack.enter_context(TemporaryFile(dir=self.workdir))
 +            try:
++                report_chat_stage('chat_launch')
 +                process = stack.enter_context(windows_process(command, cwd=self.executable.parent,
 +                    env={**os.environ, 'CUDA_CACHE_PATH': str(cache)}, stdin=subprocess.DEVNULL, stdout=log, stderr=log))
++                report_chat_stage('chat_loading')
 +                server = LlamaSession(f'http://127.0.0.1:{port}', key, process, cancel, deadline)
 +                while True:
 +                    check_running(cancel, deadline)
@@ -1403,15 +1471,16 @@ index 0000000000000000000000000000000000000000..3f3b3740dbc866d51ec061de02044ceb
 +                raise EngineError('27B 本機回覆格式無法核對。', 'invalid_response') from exc
 diff --git a/assistant/qwen27_learning.py b/assistant/qwen27_learning.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..c6ae7028760189565050c5c7419b4c7ee94533d1
+index 0000000000000000000000000000000000000000..f5415e4f2af822f0afa6acf7b38ffa9d8a4eff67
 --- /dev/null
 +++ b/assistant/qwen27_learning.py
-@@ -0,0 +1,383 @@
+@@ -0,0 +1,416 @@
 +"""Prepare and run one idle-only 27B LoRA batch using current local confirmations."""
 +from contextlib import ExitStack
 +import hashlib
 +import os
 +from pathlib import Path
++import re
 +import sqlite3
 +import subprocess
 +import time
@@ -1439,6 +1508,12 @@ index 0000000000000000000000000000000000000000..c6ae7028760189565050c5c7419b4c7e
 +WAIT_SECONDS = 3600
 +WORK_SECONDS = 1800
 +ACTIVE_STAGES = {'waiting', 'baseline', 'training', 'converting', 'checking'}
++
++
++class CandidateUnavailable(ValueError):
++    def __init__(self, status, message):
++        super().__init__(message)
++        self.status = status
 +
 +
 +def evaluation_profile():
@@ -1741,17 +1816,36 @@ index 0000000000000000000000000000000000000000..c6ae7028760189565050c5c7419b4c7e
 +        return receipt
 +
 +
-+def verified_candidate(data_dir, job_id):
-+    path = job_path(data_dir, job_id)
-+    manifest, receipt = read_job(path)
++def check_candidate(store, path, manifest, receipt):
 +    if receipt['status'] == 'validated' and not current_evaluation(manifest, receipt):
-+        raise ValueError('此候選需用目前網頁聊天設定重新驗收。')
++        raise CandidateUnavailable('needs_chat_validation', '此候選需用目前網頁聊天設定重新驗收。')
 +    adapter = path / 'adapter.gguf'
-+    if (receipt['status'] != 'validated' or not passes(assessment(manifest['suite'], receipt['baseline'], receipt['candidate']))
-+            or file_hash(adapter) != receipt['adapter_sha256']):
-+        raise ValueError('只可選用已通過完整驗收的 27B 適配器。')
-+    batches.examples_current(Store(Path(data_dir) / 'assistant.sqlite3'), manifest)
-+    return adapter, receipt['adapter_sha256']
++    digest = receipt.get('adapter_sha256')
++    try:
++        passed = receipt['status'] == 'validated' and passes(assessment(manifest['suite'], receipt['baseline'], receipt['candidate']))
++    except (ValueError, TypeError, KeyError, AttributeError):
++        passed = False
++    if not passed or not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest):
++        raise CandidateUnavailable('candidate_unavailable', '只可選用已通過完整驗收的 27B 適配器。')
++    try:
++        batches.examples_current(store, manifest)
++    except (ValueError, TypeError, KeyError) as exc:
++        raise CandidateUnavailable('source_changed', '此適配器使用的更正已撤回、改版或無法核對。請改用底座或其他可用模型。') from exc
++    if not adapter.is_file():
++        raise CandidateUnavailable('candidate_unavailable', '找不到此適配器的本機檔案。請改用底座或其他可用模型。')
++    return adapter, digest
++
++
++def available_candidate(store, job_id):
++    path = job_path(store.path.parent, job_id)
++    return check_candidate(store, path, *read_job(path))
++
++
++def verified_candidate(data_dir, job_id):
++    adapter, digest = available_candidate(Store(Path(data_dir) / 'assistant.sqlite3'), job_id)
++    if file_hash(adapter) != digest:
++        raise CandidateUnavailable('candidate_unavailable', '此適配器的本機檔案已變更。請改用底座或其他可用模型。')
++    return adapter, digest
 +
 +
 +def observed_job(path):
@@ -1775,17 +1869,24 @@ index 0000000000000000000000000000000000000000..c6ae7028760189565050c5c7419b4c7e
 +        return read_job(path)
 +
 +
-+def recent_jobs(data_dir):
-+    parent = Path(data_dir) / 'learning-batches' / '_qwen27_jobs'
++def recent_jobs(store, *, active=None):
++    data_dir = store.path.parent
++    parent = data_dir / 'learning-batches' / '_qwen27_jobs'
 +    if not parent.is_dir():
 +        return []
 +    rows = []
-+    for path in sorted(parent.iterdir(), key=lambda candidate: candidate.stat().st_mtime, reverse=True)[:12]:
++    paths = sorted(parent.iterdir(), key=lambda candidate: candidate.stat().st_mtime, reverse=True)[:12]
++    if active is not None and all(path.name != active for path in paths):
++        paths.append(job_path(data_dir, active))
++    for path in paths:
 +        try:
 +            manifest, receipt = observed_job(path)
 +            ui_row = {key: receipt.get(key) for key in ('status', 'assessment', 'error', 'interrupted_stage')}
-+            if receipt['status'] == 'validated' and not current_evaluation(manifest, receipt):
-+                ui_row['status'] = 'needs_chat_validation'
++            if receipt['status'] == 'validated':
++                try:
++                    check_candidate(store, path, manifest, receipt)
++                except CandidateUnavailable as exc:
++                    ui_row.update(status=exc.status, error=str(exc))
 +            rows.append({'id': path.name, **ui_row})
 +        except (ValueError, OSError, KeyError, TypeError, sqlite3.Error):
 +            continue
@@ -2233,10 +2334,18 @@ index c82591b7eac406d9b7874878892260091f1ac3d7..e9f8cf5c101e004cf68a34084cc42bb2
                  raw = LocalEngine(args.data_dir, experiment=args.local_experiment, batch=args.local_batch,
                                    active=args.local_active, recover_chat_budget=True)
 diff --git a/scripts/daily_delivery.py b/scripts/daily_delivery.py
-index 3586924f9b2f65f9a63b153912e01928b6a43db1..4bec80f00d3aff4dcc33b3c50889fc4b35018f8f 100644
+index 3586924f9b2f65f9a63b153912e01928b6a43db1..f70519a782463f6e18129f96188cce72d27d6f6d 100644
 --- a/scripts/daily_delivery.py
 +++ b/scripts/daily_delivery.py
-@@ -540,3 +540,10 @@ class DailyLocalEngine:
+@@ -9,6 +9,7 @@ from assistant.context import CURRENT_MESSAGE_ONLY, _instruction_text, current_m
+ from assistant.engine import render_prompt
+ from scripts import daily_dialogue, daily_stock
+ from scripts.daily_identifiers import missing_literal, omit_unrelated_identifier, supplied_code
++from scripts.learning.runtime import report_chat_stage
+ 
+ SEP = r'(?:^|[。！？；，,;？?\n])\s*'
+ ONLY = r'(?:請)?只(?:需|要)?(?:回傳|回覆|回答|輸出|給|填入|填|回)'
+@@ -540,3 +541,15 @@ class DailyLocalEngine:
              return concise
          delivered = extract(question, omit_unrelated_identifier(ctx, explanation_body(ctx, draft)))
          return daily_stock.concise(ctx, delivered) or delivered
@@ -2247,6 +2356,11 @@ index 3586924f9b2f65f9a63b153912e01928b6a43db1..4bec80f00d3aff4dcc33b3c50889fc4b
 +
 +    def describe(self):
 +        return {**super().describe(), 'interface': self.interface}
++
++    def answer_with_delivery(self, prompt, cancel=None):
++        delivered = super().answer_with_delivery(prompt, cancel)
++        report_chat_stage('chat_finalizing')
++        return delivered
 diff --git a/scripts/learning/qwen27_worker.py b/scripts/learning/qwen27_worker.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..708b4fc31bc3749e36fd5fbae10da8d70c52bac7
@@ -2400,10 +2514,10 @@ index 0000000000000000000000000000000000000000..708b4fc31bc3749e36fd5fbae10da8d7
 +    with web_model_task('training'):
 +        fit(folder)
 diff --git a/scripts/learning/runtime.py b/scripts/learning/runtime.py
-index 7b43f429b175b8c9e62936b7121a9327e18f4acf..e35ce332171561f0cd43c9981084cc142d8094fc 100644
+index 7b43f429b175b8c9e62936b7121a9327e18f4acf..627e022f6948211497f09e406b578869583656ea 100644
 --- a/scripts/learning/runtime.py
 +++ b/scripts/learning/runtime.py
-@@ -1,14 +1,127 @@
+@@ -1,14 +1,140 @@
 -"""Process-held advisory GPU lease; a leftover file never proves a live owner."""
 +"""Web-authorized model tasks and process-held advisory GPU leases."""
 +from contextvars import ContextVar
@@ -2419,6 +2533,11 @@ index 7b43f429b175b8c9e62936b7121a9327e18f4acf..e35ce332171561f0cd43c9981084cc14
  ROOT = Path(__file__).resolve().parents[2]
 +GPU_LOCK = ROOT / 'data/learning/gpu.lock'
 +_WEB_TASK = ContextVar('web_model_task', default=None)
++CHAT_STAGES = {
++    'chat_context', 'chat_checking', 'chat_launch', 'chat_runtime', 'chat_assets',
++    'chat_tokenizing', 'chat_loading', 'chat_prefill', 'chat_generating',
++    'chat_completing', 'chat_finalizing',
++}
 +
 +
 +class ModelPowerRequired(PermissionError):
@@ -2432,11 +2551,12 @@ index 7b43f429b175b8c9e62936b7121a9327e18f4acf..e35ce332171561f0cd43c9981084cc14
 +
 +
 +class WebModelTask:
-+    def __init__(self, mode, cancel=None):
++    def __init__(self, mode, cancel=None, *, on_progress=None):
 +        if mode not in ('chat', 'training'):
 +            raise ValueError('無效的網頁模型授權。')
 +        self.mode = mode
 +        self.cancel = cancel if cancel is not None else Event()
++        self.on_progress = on_progress
 +        self.lock = RLock()
 +        self.terminators = set()
 +
@@ -2461,8 +2581,15 @@ index 7b43f429b175b8c9e62936b7121a9327e18f4acf..e35ce332171561f0cd43c9981084cc14
 +            raise failure
 +
 +
-+def web_model_task(mode, cancel=None):
-+    return WebModelTask(mode, cancel).activate()
++def web_model_task(mode, cancel=None, *, on_progress=None):
++    return WebModelTask(mode, cancel, on_progress=on_progress).activate()
++
++
++def report_chat_stage(stage):
++    task = _WEB_TASK.get()
++    if (task is not None and task.mode == 'chat' and not task.cancel.is_set()
++            and task.on_progress is not None and stage in CHAT_STAGES):
++        task.on_progress(stage)
 +
 +
 +@contextmanager
@@ -2535,11 +2662,11 @@ index 7b43f429b175b8c9e62936b7121a9327e18f4acf..e35ce332171561f0cd43c9981084cc14
      # another process may already have an open handle to the same file.
 diff --git a/tests/test_html_chat.py b/tests/test_html_chat.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..60a5fb89593c3e01e66fe9f2606d4612c76251ad
+index 0000000000000000000000000000000000000000..56dd95ff20f3f864f4e12f6df27a2747fc8c10ea
 --- /dev/null
 +++ b/tests/test_html_chat.py
-@@ -0,0 +1,663 @@
-+from contextlib import contextmanager
+@@ -0,0 +1,789 @@
++from contextlib import contextmanager, nullcontext
 +import json
 +import os
 +from pathlib import Path
@@ -2549,7 +2676,7 @@ index 0000000000000000000000000000000000000000..60a5fb89593c3e01e66fe9f2606d4612
 +import time
 +import unittest
 +from threading import Event
-+from unittest.mock import patch
++from unittest.mock import Mock, patch
 +from urllib.error import HTTPError
 +from urllib.request import Request, urlopen
 +
@@ -2807,6 +2934,132 @@ index 0000000000000000000000000000000000000000..60a5fb89593c3e01e66fe9f2606d4612
 +        self.assertEqual(row['status'], 'needs_chat_validation')
 +        with self.assertRaisesRegex(ValueError, '重新驗收'):
 +            qwen27_learning.verified_candidate(data_dir, job_id)
++
++    def test_27b_chat_reports_actual_runtime_stages(self):
++        root = self.store.path.parent
++        executable, weights = root / 'synthetic.exe', root / 'synthetic.gguf'
++        executable.touch()
++        weights.touch()
++        process = Mock()
++        process.poll.return_value = None
++        response = {'choices': [{'finish_reason': 'stop', 'message': {'content': '甲'}}], 'usage': {'prompt_tokens': 2}}
++        stages = []
++        with (
++            patch('assistant.qwen27_engine.model_assets', return_value=(executable, weights)),
++            patch('assistant.qwen27_engine.ASSETS', root),
++            patch('assistant.qwen27_engine.gpu_lease', return_value=nullcontext()),
++            patch('assistant.qwen27_engine.windows_process', return_value=nullcontext(process)),
++            patch.object(LlamaSession, 'request', return_value={'status': 'ok'}) as health,
++            patch.object(LlamaSession, 'query', side_effect=[{'prompt': 'mock'}, {'tokens': [1, 2]}, response]),
++            web_model_task('chat', on_progress=stages.append),
++        ):
++            engine = Qwen27Engine(root)
++            self.assertEqual(engine.answer('請回答甲。'), '甲')
++        health.assert_called_once_with('/health', timeout=1)
++        self.assertEqual(stages, ['chat_checking', 'chat_launch', 'chat_loading', 'chat_tokenizing', 'chat_completing'])
++
++    @unittest.skipUnless(os.name == 'nt', 'Windows model process ownership')
++    def test_4b_chat_reports_worker_progress_with_separate_phase_times(self):
++        root = self.store.path.parent
++        next_stage, finish = root / 'continue-probe', root / 'finish-probe'
++        engine = LocalEngine(root, web_owned=True)
++        app = ChatApp(self.store, controlled=True)
++        probe = f"""from pathlib import Path
++import time
++from assistant import local_worker
++from scripts.learning.runtime import report_chat_stage
++def wait(path):
++    until = time.monotonic() + 9
++    while not Path(path).exists():
++        if time.monotonic() >= until:
++            raise TimeoutError()
++        time.sleep(.04)
++def stub(request):
++    report_chat_stage('chat_assets')
++    wait({str(next_stage)!r})
++    report_chat_stage('chat_loading')
++    wait({str(finish)!r})
++    return {{'schema':'local_inference_result_v1','status':'succeeded','answer':'甲',
++             'selection_fingerprint':request['selection']['fingerprint'],
++             'input_tokens':2,'output_tokens':1,'peak_gpu_bytes':0}}
++local_worker.infer = stub
++raise SystemExit(local_worker.main())
++"""
++
++        def await_stage(name):
++            deadline = time.monotonic() + 7
++            while time.monotonic() < deadline:
++                state = app.status()
++                if state['stage'] == name:
++                    return state
++                time.sleep(.05)
++            self.fail('never observed ' + name + ' from the synthetic worker')
++
++        app.change_mode('chat')
++        with patch.object(engine, 'command', side_effect=lambda output: [sys.executable, '-c', probe, '--output', str(output)]):
++            try:
++                app.start('chat', lambda cancel, notice: engine.answer('測試階段', cancel))
++                assets = await_stage('chat_assets')
++                next_stage.touch()
++                loading = await_stage('chat_loading')
++                self.assertTrue(loading['running'])
++                self.assertEqual(loading['started_at'], assets['started_at'])
++                self.assertGreater(loading['stage_started_at'], assets['stage_started_at'])
++                finish.touch()
++                app.worker.join(7)
++                self.assertEqual(app.status()['stage'], 'done')
++                self.assertEqual(app.status()['last_active_stage'], 'chat_loading')
++            finally:
++                app.change_mode('off')
++
++    def test_web_withdrawal_blocks_the_selected_adapter_before_submitting_the_draft(self):
++        data_dir = self.store.path.parent
++        a = learning_queue.confirm(self.store, '樣品 A 的代碼？', '青')
++        b = learning_queue.confirm(self.store, '樣品 B 的代碼？', '紫')
++        with patch.object(qwen27_learning, 'model_assets'), patch.object(
++                qwen27_learning, 'training_assets', return_value=(None, None, {})):
++            jobs = {}
++            for item in (a, b):
++                job_id = qwen27_learning.prepare(self.store, [{key: item[key] for key in ('id', 'revision')}],
++                                                {'prompt': '對應樣品要填哪個代碼？', 'answer': item['answer']})
++                folder = qwen27_learning.job_path(data_dir, job_id)
++                adapter = folder / 'adapter.gguf'
++                adapter.write_bytes(b'synthetic adapter')
++                _, receipt = qwen27_learning.read_job(folder)
++                learning_batches.save(folder / 'receipt.json', {**receipt, 'status': 'validated',
++                    'baseline': ['乙', '貓', '43'], 'baseline_calls': [1, 1, 1],
++                    'candidate': [item['answer'], '貓', '43'], 'candidate_calls': [1, 1, 1],
++                    'adapter_sha256': qwen27_learning.file_hash(adapter)})
++                jobs[item['id']] = job_id
++        active = jobs[a['id']]
++        unrelated = jobs[b['id']]
++        cuda = data_dir / 'fixture-llama.exe'
++        weights = data_dir / 'fixture-weights.gguf'
++        cuda.touch()
++        weights.touch()
++        with patch('assistant.html_chat.Qwen27Engine', Qwen27Engine), patch(
++                'assistant.qwen27_engine.model_assets', return_value=(cuda, weights)):
++            app = ChatApp(self.store, controlled=True)
++            self.assertEqual(app.dispatch('select', {'id': active})['selection']['batch'], active)
++            app.change_mode('chat')
++            question = '請幫我核對新樣品。'
++            draft = app.draft(self.sid, {'revision': 0, 'content': question})
++            app.dispatch('withdraw', {'id': a['id'], 'revision': a['revision']})
++            snapshot = app.learning()
++            states = {row['id']: row['status'] for row in snapshot['jobs']}
++            self.assertEqual(states, {active: 'source_changed', unrelated: 'validated'})
++            self.assertEqual(snapshot['active'], active)
++            self.assertEqual(qwen27_learning.read_job(qwen27_learning.job_path(data_dir, active))[1]['status'], 'validated')
++            with self.assertRaisesRegex(qwen27_learning.CandidateUnavailable, '撤回、改版'):
++                app.dispatch('ask', {'sid': self.sid, 'question': question, 'draft_revision': draft['revision']})
++            self.assertIsNone(app.worker)
++            self.assertEqual(self.store.messages(self.sid), [])
++            self.assertEqual(app.draft(self.sid), draft)
++            self.assertEqual(app.dispatch('select', {'id': None})['selection']['batch'], None)
++            learning_queue.confirm(self.store, b['prompt'], '黃', item_id=b['id'], expected_revision=b['revision'])
++            after = {row['id']: row['status'] for row in app.learning()['jobs']}
++            self.assertEqual(after, {active: 'source_changed', unrelated: 'source_changed'})
++            app.change_mode('off')
 +
 +    @unittest.skipUnless(os.name == 'nt', 'Windows model process ownership')
 +    def test_learning_history_recovers_interrupted_owner_and_keeps_current_examples(self):

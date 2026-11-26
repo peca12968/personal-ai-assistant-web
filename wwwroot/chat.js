@@ -67,7 +67,13 @@ function action(text, fn, css) {
   button.addEventListener('click', fn);
   return button;
 }
-function showStatus(text) { $('status').textContent = text; }
+function showStatus(text) {
+  if ($('status').textContent !== text) $('status').textContent = text;
+}
+function elapsedText(value) {
+  const seconds = Math.max(0, Math.floor(Date.now() / 1000 - value));
+  return seconds < 60 ? seconds + ' 秒' : Math.floor(seconds / 60) + ' 分 ' + (seconds % 60) + ' 秒';
+}
 function draftNotice(text) { $('draft-status').textContent = text; }
 function showModel(selected) {
   const limits = models[selected?.id];
@@ -164,6 +170,14 @@ function busyState() {
     {off: '使用模型與訓練已關閉', chat: '使用模型已開啟 · 可送出訊息',
       training: '訓練已開啟 · 可安排微調', stopping: '正在確認模型程序退出'}[mode] || '';
   $('stop').hidden = !inProgress;
+  const timer = $('stage-time');
+  timer.hidden = !(job?.running && job.kind === 'chat' &&
+    Number.isFinite(job.stage_started_at) && Number.isFinite(job.started_at));
+  if (!timer.hidden) {
+    timer.textContent = '本階段 ' + elapsedText(job.stage_started_at) + ' · 本輪共 ' + elapsedText(job.started_at);
+  } else {
+    timer.textContent = '';
+  }
   $('stop-learning').hidden = !(job?.running && job.kind === 'learning');
   $('start-learning').disabled = !connected || inProgress || mode !== 'training';
 }
@@ -284,10 +298,22 @@ $('older-messages').addEventListener('click', async () => {
 });
 const stages = {
   prepared: '尚未開始', queued: '等待本機程序', answering: '本機模型正在回答',
+  chat_context: '正在整理對話與輸入',
+  chat_checking: '正在核對模型設定與本機資源',
+  chat_launch: '正在啟動本機推理程序',
+  chat_runtime: '正在初始化推理環境',
+  chat_assets: '正在核對模型權重檔案',
+  chat_tokenizing: '正在套用提示格式並計算 token',
+  chat_loading: '正在將模型載入 RAM 與顯存',
+  chat_prefill: '正在處理輸入並建立快取',
+  chat_generating: '正在逐步生成回覆',
+  chat_completing: '正在處理輸入與生成回覆',
+  chat_finalizing: '正在檢查並保存回覆',
   waiting: '等候電腦連續閒置 10 分鐘', baseline: '正在量測微調前的回答',
   training: '正在本機微調 LoRA', converting: '正在轉成 GGUF',
   checking: '正在重載並驗收', validated: '候選已通過驗收',
   needs_chat_validation: '待依目前聊天設定驗收',
+  source_changed: '確認更正已撤回或改版', candidate_unavailable: '適配器資料無法核對',
   rejected: '候選未通過保留題或控制題', already_correct: '底座已答對保留題',
   stale: '確認更正已變更', done: '已完成', failed: '本次未完成', cancelled: '已停止', interrupted: '已中斷'
 };
@@ -328,7 +354,9 @@ async function poll() {
       }
     }
     if (job.id && (job.running || lastJob !== job.id || submitted)) {
-      const notice = [state, job.error].filter(Boolean).join(' · ');
+      const lastPhase = !job.running && job.kind === 'chat' && ['failed', 'cancelled'].includes(job.stage)
+        ? stages[job.last_active_stage] : null;
+      const notice = [state, lastPhase ? '最後階段 ' + lastPhase : null, job.error].filter(Boolean).join(' · ');
       showStatus(notice);
       if (job.kind === 'learning') $('learning-status').textContent = notice;
       if (!job.running) {
@@ -530,8 +558,9 @@ async function learningData() {
   const candidates = state.jobs.map(row => {
     const line = element('div', undefined, 'candidate');
     const phase = row.status === 'interrupted' ? interruptedStages[row.interrupted_stage] : '';
-    line.append(element('span', [phase ? phase + '時中斷' : (stages[row.status] || row.status),
-      row.id.slice(0, 8)].join(' · ')));
+    const label = [row.id === state.active ? '目前選用' : null,
+      phase ? phase + '時中斷' : (stages[row.status] || row.status), row.id.slice(0, 8)];
+    line.append(element('span', label.filter(Boolean).join(' · ')));
     if (row.status === 'validated' && row.id !== state.active) {
       line.append(action('選用', () => selectVersion(row.id)));
     }
@@ -545,7 +574,10 @@ async function selectVersion(id) {
     if (!(await changeModel({id}))) return;
     await learningData();
     $('learning-status').textContent = '已儲存模型選擇。';
-  } catch (error) { $('learning-status').textContent = error.message; }
+  } catch (error) {
+    if ($('learning-dialog').open) await learningData().catch(() => {});
+    $('learning-status').textContent = error.message;
+  }
 }
 async function changeModel(body) {
   if (!connected || selecting || switching || pending || preparingDraft || job?.running || mode === 'stopping') return false;
