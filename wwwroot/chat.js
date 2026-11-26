@@ -283,12 +283,15 @@ $('older-messages').addEventListener('click', async () => {
   }
 });
 const stages = {
-  queued: '等待本機程序', answering: '本機模型正在回答',
+  prepared: '尚未開始', queued: '等待本機程序', answering: '本機模型正在回答',
   waiting: '等候電腦連續閒置 10 分鐘', baseline: '正在量測微調前的回答',
   training: '正在本機微調 LoRA', converting: '正在轉成 GGUF',
   checking: '正在重載並驗收', validated: '候選已通過驗收',
   rejected: '候選未通過保留題或控制題', already_correct: '底座已答對保留題',
-  stale: '確認更正已變更', done: '已完成', failed: '本次未完成', cancelled: '已停止'
+  stale: '確認更正已變更', done: '已完成', failed: '本次未完成', cancelled: '已停止', interrupted: '已中斷'
+};
+const interruptedStages = {
+  waiting: '閒置等待', baseline: '基準測試', training: 'LoRA 微調', converting: '格式轉換', checking: '重載驗收'
 };
 async function poll() {
   const powerAtRequest = powerRevision;
@@ -525,7 +528,9 @@ async function learningData() {
   if (kept < selected.size) $('learning-status').textContent = '已改版或撤回的例子已取消選取。請重新核對。';
   const candidates = state.jobs.map(row => {
     const line = element('div', undefined, 'candidate');
-    line.append(element('span', (stages[row.status] || row.status) + ' · ' + row.id.slice(0, 8)));
+    const phase = row.status === 'interrupted' ? interruptedStages[row.interrupted_stage] : '';
+    line.append(element('span', [phase ? phase + '時中斷' : (stages[row.status] || row.status),
+      row.id.slice(0, 8)].join(' · ')));
     if (row.status === 'validated' && row.id !== state.active) {
       line.append(action('選用', () => selectVersion(row.id)));
     }
