@@ -597,6 +597,7 @@ async function learningData() {
     const label = [row.id === state.active ? '目前選用' : null,
       phase ? phase + '時中斷' : (stages[row.status] || row.status), row.id.slice(0, 8)];
     line.append(element('span', label.filter(Boolean).join(' · ')));
+    if (row.status === 'rejected' && row.error) line.append(element('small', row.error));
     if (row.status === 'validated' && row.id !== state.active) {
       line.append(action('選用', () => selectVersion(row.id)));
     }
