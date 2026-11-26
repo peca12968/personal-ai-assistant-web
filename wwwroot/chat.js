@@ -75,14 +75,16 @@ function elapsedText(value) {
   return seconds < 60 ? seconds + ' 秒' : Math.floor(seconds / 60) + ' 分 ' + (seconds % 60) + ' 秒';
 }
 function draftNotice(text) { $('draft-status').textContent = text; }
-function showModel(selected) {
+function showModel(selected, refresh = false) {
   const limits = models[selected?.id];
-  if (!limits || (selection?.id === selected.id && selection.batch === selected.batch)) return;
+  if (!limits || (!refresh && selection?.id === selected.id && selection.batch === selected.batch)) return;
   selection = selected;
   const control = $('model-select');
   const options = Object.entries(models).map(([id, model]) => {
-    const option = element('option', model.label);
+    const unavailable = model.available === false;
+    const option = element('option', model.label + (unavailable ? '（權重未就緒）' : ''));
     option.value = id;
+    option.disabled = unavailable;
     return option;
   });
   if (selected.batch) {
@@ -283,7 +285,7 @@ function showView(state, powerAtRequest, modelAtRequest) {
   historyCursor = state.before;
   if (!switching && powerAtRequest === powerRevision) mode = state.mode;
   models = state.models || {};
-  if (!selecting && modelAtRequest === modelRevision) showModel(state.selection);
+  if (!selecting && modelAtRequest === modelRevision) showModel(state.selection, true);
   busyState();
   if (state.warning) showStatus(state.warning);
   $('title').textContent = state.title;

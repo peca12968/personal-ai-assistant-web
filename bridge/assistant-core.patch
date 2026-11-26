@@ -448,10 +448,10 @@ index 78bfad433d1abe8c476e44d04bc20f8b5c167020..a96dfd9638c9157c10c256798bad45e1
                  "excerpt_ids": [row["message_id"] for row in context["earlier_user_excerpts"]],
 diff --git a/assistant/html_chat.py b/assistant/html_chat.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..2a1a1361b48a7a1f28b273e4d9e2c6a87d5be238
+index 0000000000000000000000000000000000000000..1a164ed54de37b125c989126ddf22e8f7527e7c7
 --- /dev/null
 +++ b/assistant/html_chat.py
-@@ -0,0 +1,612 @@
+@@ -0,0 +1,620 @@
 +"""F-drive HTML desktop client for the existing local assistant and 27B runner."""
 +import argparse
 +from contextlib import contextmanager
@@ -476,7 +476,7 @@ index 0000000000000000000000000000000000000000..2a1a1361b48a7a1f28b273e4d9e2c6a8
 +from .local_models import read_json
 +from .owned_process import windows_process
 +from .profile_tone_read import MODE as PROFILE_TONE_MODE
-+from .qwen27_engine import CONTEXT, REPLY_TOKENS, ALIAS, Qwen27Engine
++from .qwen27_engine import ALIAS, CONTEXT, Q8_ALIAS, Q8_CONTEXT, REPLY_TOKENS, Qwen27Engine, q8_assets_ready
 +from .store import Store
 +from scripts.daily_delivery import WebChatEngine
 +from scripts.daily_expenses import DailyAssistant
@@ -495,6 +495,8 @@ index 0000000000000000000000000000000000000000..2a1a1361b48a7a1f28b273e4d9e2c6a8
 +MODEL_OPTIONS = {
 +    ALIAS: {'label': 'Qwen3.8-27B BF16', 'context_tokens': CONTEXT,
 +            'input_tokens': CONTEXT - REPLY_TOKENS - 4, 'output_tokens': REPLY_TOKENS},
++    Q8_ALIAS: {'label': 'Qwen3.8-27B Q8_0', 'context_tokens': Q8_CONTEXT,
++               'input_tokens': Q8_CONTEXT - REPLY_TOKENS - 4, 'output_tokens': REPLY_TOKENS},
 +    MODEL_4B: {'label': 'Qwen3-4B BF16', 'context_tokens': None,
 +               'input_tokens': local_models.MAX_INPUT_TOKENS, 'output_tokens': local_models.MAX_OUTPUT_TOKENS},
 +}
@@ -544,6 +546,8 @@ index 0000000000000000000000000000000000000000..2a1a1361b48a7a1f28b273e4d9e2c6a8
 +                details.append('LoRA 批次 ' + batch)
 +        elif selection.get('confirmed_batch') is False:
 +            tuning = '底座'
++    elif model == 'Qwen3.8-27B' and selection.get('precision') == 'Q8_0':
++        name = MODEL_OPTIONS[Q8_ALIAS]['label']
 +    elif model == 'Qwen/Qwen3-4B' and selection.get('kind') == 'local_qwen':
 +        name = MODEL_OPTIONS[MODEL_4B]['label']
 +        version = selection.get('parameter_version')
@@ -555,7 +559,8 @@ index 0000000000000000000000000000000000000000..2a1a1361b48a7a1f28b273e4d9e2c6a8
 +        return {'label': '來源未記錄'}
 +    revision = selection.get('revision')
 +    if isinstance(revision, str) and re.fullmatch(r'[0-9a-f]{40}', revision):
-+        details.append('底座版本 ' + revision)
++        version_label = 'GGUF 版本' if selection.get('precision') == 'Q8_0' else '底座版本'
++        details.append(version_label + ' ' + revision)
 +    prefix = '' if context.get(answer_runs.ORIGIN_FIELD) == 'model' else '當時選用 '
 +    suffix = ' · ' + tuning if tuning else ''
 +    return {'label': prefix + name + suffix, 'detail': '\n'.join(details)}
@@ -585,6 +590,8 @@ index 0000000000000000000000000000000000000000..2a1a1361b48a7a1f28b273e4d9e2c6a8
 +    def set_engine(self, model, batch=None, *, persist=False):
 +        if model == ALIAS:
 +            engine = Qwen27Engine(self.store.path.parent, batch=batch)
++        elif model == Q8_ALIAS and batch is None:
++            engine = Qwen27Engine(self.store.path.parent, alias=Q8_ALIAS)
 +        elif model == MODEL_4B and batch is None:
 +            engine = LocalEngine(self.store.path.parent, recover_chat_budget=True, web_owned=True)
 +            if not engine.python.is_file():
@@ -619,11 +626,12 @@ index 0000000000000000000000000000000000000000..2a1a1361b48a7a1f28b273e4d9e2c6a8
 +        sid = session['id']
 +        answer_runs.recover(self.store, sid)
 +        page = self.history_page(sid)
++        models = {**MODEL_OPTIONS, Q8_ALIAS: {**MODEL_OPTIONS[Q8_ALIAS], 'available': q8_assets_ready()}}
 +        with self.guard:
 +            return {**page, 'title': session['title'], 'model': self.engine.display_name,
 +                    'sessions': [{key: row[key] for key in ('id', 'title')} for row in rows],
 +                    'can_retry': page['retry'] is not None, 'warning': self.warning, 'mode': self.mode,
-+                    'models': MODEL_OPTIONS, 'selection': self.model_state()}
++                    'models': models, 'selection': self.model_state()}
 +
 +    def history_page(self, sid, *, before=None):
 +        with self.store.connect() as db:
@@ -1613,11 +1621,11 @@ index 0000000000000000000000000000000000000000..e4eb5a10dc46324b1b090f690f31e8a7
 +        api.CloseHandle(job)
 diff --git a/assistant/qwen27_engine.py b/assistant/qwen27_engine.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..6b66109e98a42567b1db861af26ce5daf2ed3158
+index 0000000000000000000000000000000000000000..d501a71847583cc4daaceebe29576be148e770ef
 --- /dev/null
 +++ b/assistant/qwen27_engine.py
-@@ -0,0 +1,247 @@
-+"""Loopback-only CUDA llama.cpp inference for the verified Qwen3.8-27B GGUF."""
+@@ -0,0 +1,282 @@
++"""Loopback-only CUDA llama.cpp inference for verified Qwen3.8-27B GGUF weights."""
 +from contextlib import contextmanager, ExitStack
 +import json
 +import os
@@ -1648,6 +1656,12 @@ index 0000000000000000000000000000000000000000..6b66109e98a42567b1db861af26ce5da
 +CONTEXT = 8192
 +REPLY_TOKENS = 512
 +ALIAS = 'qwen38-27b-bf16'
++Q8_ALIAS = 'qwen38-27b-q8-0'
++Q8_NAME = 'Qwen3.8-27B-Q8_0.gguf'
++Q8_SIZE = 29116388960
++Q8_REVISION = '419d4bf0b4841d3517a2a15a70465abdf655281c'
++Q8_SHA256 = 'a830e736efa71ce29589ff20b8713333a427e0d46ab774723be23800ad54362d'
++Q8_CONTEXT = 16384
 +THINKING = {'reasoning_effort': 'none', 'chat_template_kwargs': {'enable_thinking': False}}
 +
 +
@@ -1660,12 +1674,26 @@ index 0000000000000000000000000000000000000000..6b66109e98a42567b1db861af26ce5da
 +    return stat.st_size, stat.st_mtime_ns
 +
 +
-+def model_assets():
-+    model = ASSETS / 'chat' / MODEL_NAME
++def q8_assets_ready():
++    try:
++        stat = (ASSETS / 'chat-q8' / Q8_NAME).stat()
++        return stat.st_size == Q8_SIZE and local_models.read_json(ASSETS / 'chat-q8-verified.json', limit=1024) == {
++            'file': Q8_NAME, 'size': Q8_SIZE, 'sha256': Q8_SHA256, 'mtime_ns': stat.st_mtime_ns,
++        }
++    except (OSError, ValueError, RecursionError):
++        return False
++
++
++def model_assets(alias=ALIAS):
++    if alias == Q8_ALIAS:
++        model = ASSETS / 'chat-q8' / Q8_NAME
++        ready = q8_assets_ready()
++    else:
++        model = ASSETS / 'chat' / MODEL_NAME
++        ready = (ASSETS / 'chat-verified.json').is_file() and identity(model)[0] == MODEL_SIZE
 +    options = list((ASSETS / 'llama-cuda').rglob('llama-server.exe'))
-+    if (len(options) != 1 or not (ASSETS / 'runtime-verified.json').is_file()
-+            or not (ASSETS / 'chat-verified.json').is_file() or identity(model)[0] != MODEL_SIZE):
-+        raise ValueError('F 槽的 27B BF16 權重或 CUDA 執行檔尚未就緒。')
++    if not ready or len(options) != 1 or not (ASSETS / 'runtime-verified.json').is_file():
++        raise ValueError('F 槽的 27B 權重或 CUDA 執行檔尚未就緒。')
 +    return options[0], model
 +
 +
@@ -1703,9 +1731,10 @@ index 0000000000000000000000000000000000000000..6b66109e98a42567b1db861af26ce5da
 +
 +
 +class LlamaSession:
-+    def __init__(self, address, key, process, cancel, deadline):
++    def __init__(self, address, key, process, cancel, deadline, *, alias=ALIAS, context=CONTEXT):
 +        self.address, self.key, self.process = address, key, process
 +        self.cancel, self.deadline = cancel, deadline
++        self.alias, self.context = alias, context
 +
 +    def request(self, path, body=None, *, timeout=900):
 +        data = json.dumps(body, ensure_ascii=False).encode('utf-8') if body is not None else None
@@ -1741,10 +1770,10 @@ index 0000000000000000000000000000000000000000..6b66109e98a42567b1db861af26ce5da
 +
 +    def answer(self, messages, *, max_tokens=REPLY_TOKENS):
 +        report_chat_stage('chat_tokenizing')
-+        body = {'model': ALIAS, 'messages': messages, **THINKING}
++        body = {'model': self.alias, 'messages': messages, **THINKING}
 +        formatted = self.query('/apply-template', body)['prompt']
 +        tokens = self.query('/tokenize', {'content': formatted, 'parse_special': True, 'add_special': True})['tokens']
-+        limit = CONTEXT - max_tokens - 4
++        limit = self.context - max_tokens - 4
 +        if len(tokens) > limit:
 +            raise EngineError(local_models.input_budget_message(len(tokens), limit), 'local_input_too_large')
 +        if not tokens:
@@ -1759,7 +1788,7 @@ index 0000000000000000000000000000000000000000..6b66109e98a42567b1db861af26ce5da
 +        prompt_tokens = usage['prompt_tokens']
 +        if (choice['finish_reason'] != 'stop' or not isinstance(answer, str) or not answer.strip()
 +                or len(answer.encode('utf-8')) > MAX_ANSWER_BYTES
-+                or type(prompt_tokens) is not int or not 1 <= prompt_tokens < CONTEXT - max_tokens):
++                or type(prompt_tokens) is not int or not 1 <= prompt_tokens < self.context - max_tokens):
 +            raise EngineError('27B 回覆內容或長度無法核對。', 'invalid_response')
 +        completion_tokens = usage.get('completion_tokens')
 +        measured = completion_tokens if type(completion_tokens) is int and 1 <= completion_tokens <= max_tokens else None
@@ -1768,19 +1797,27 @@ index 0000000000000000000000000000000000000000..6b66109e98a42567b1db861af26ce5da
 +
 +
 +class Qwen27Engine:
-+    def __init__(self, data_dir, *, batch=None, timeout=650):
++    alias, context, precision, revision = ALIAS, CONTEXT, 'BF16', MODEL_REVISION
++
++    def __init__(self, data_dir, *, batch=None, timeout=650, alias=ALIAS):
++        if alias == Q8_ALIAS and batch is not None:
++            raise ValueError('Q8_0 用於聊天，已確認的 LoRA 批次請從 BF16 選用。')
++        if alias not in (ALIAS, Q8_ALIAS):
++            raise ValueError('請選擇有效的 27B 權重。')
++        if alias == Q8_ALIAS:
++            self.alias, self.context, self.precision, self.revision = Q8_ALIAS, Q8_CONTEXT, 'Q8_0', Q8_REVISION
 +        self.data_dir = Path(data_dir).resolve()
 +        self.workdir = self.data_dir / 'local-engine-workspace'
 +        self.timeout = timeout
 +        try:
-+            self.executable, self.model = model_assets()
++            self.executable, self.model = model_assets(self.alias)
 +            self.identities = {item: identity(item) for item in (self.executable, self.model)}
 +        except (ValueError, OSError) as exc:
-+            raise EngineError('F 槽的 27B BF16 權重或 CUDA 執行檔尚未就緒。', 'local_environment') from exc
++            raise EngineError(f'F 槽的 27B {self.precision} 權重或 CUDA 執行檔尚未就緒。', 'local_environment') from exc
 +        self.batch = batch
 +        self.adapter = None if batch is None else self._candidate()
 +        label = ' · LoRA' if batch else ''
-+        self.display_name = 'Qwen3.8-27B BF16' + label
++        self.display_name = f'Qwen3.8-27B {self.precision}' + label
 +
 +    def _candidate(self):
 +        from .qwen27_learning import verified_candidate
@@ -1788,8 +1825,8 @@ index 0000000000000000000000000000000000000000..6b66109e98a42567b1db861af26ce5da
 +
 +    def describe(self):
 +        return {'runs_on_this_computer': True, 'engine': 'llama.cpp CUDA', 'llama_build': BUILD,
-+                'model': 'Qwen3.8-27B', 'precision': 'BF16', 'revision': MODEL_REVISION,
-+                'context_tokens': CONTEXT, 'confirmed_batch': self.batch is not None,
++                'model': 'Qwen3.8-27B', 'precision': self.precision, 'revision': self.revision,
++                'context_tokens': self.context, 'confirmed_batch': self.batch is not None,
 +                'adapter_batch': self.batch, 'adapter_sha256': self.adapter[1] if self.adapter else None}
 +
 +    def verify(self):
@@ -1800,7 +1837,12 @@ index 0000000000000000000000000000000000000000..6b66109e98a42567b1db861af26ce5da
 +
 +    @contextmanager
 +    def session(self, cancel=None, *, test_adapter=None):
-+        require_web_model('chat', 'training')
++        if self.alias == Q8_ALIAS:
++            require_web_model('chat')
++            if test_adapter is not None:
++                raise ValueError('請使用 BF16 驗收 LoRA 批次。')
++        else:
++            require_web_model('chat', 'training')
 +        deadline = time.monotonic() + self.timeout
 +        check_running(cancel, deadline)
 +        report_chat_stage('chat_checking')
@@ -1817,8 +1859,8 @@ index 0000000000000000000000000000000000000000..6b66109e98a42567b1db861af26ce5da
 +                listener.bind(('127.0.0.1', 0))
 +                port = listener.getsockname()[1]
 +            key = secrets.token_urlsafe(24)
-+            command = [str(self.executable), '--model', str(self.model), '--alias', ALIAS, '--host', '127.0.0.1',
-+                '--port', str(port), '--api-key', key, '--device', 'CUDA0', '--ctx-size', str(CONTEXT),
++            command = [str(self.executable), '--model', str(self.model), '--alias', self.alias, '--host', '127.0.0.1',
++                '--port', str(port), '--api-key', key, '--device', 'CUDA0', '--ctx-size', str(self.context),
 +                '--parallel', '1', '--threads', '8', '--batch-size', '256', '--ubatch-size', '128',
 +                '--n-gpu-layers', 'auto', '--fit-target', '1536', '--jinja', '--no-ui', '--no-context-shift']
 +            adapter = test_adapter or (self.adapter[0] if self.adapter else None)
@@ -1830,7 +1872,8 @@ index 0000000000000000000000000000000000000000..6b66109e98a42567b1db861af26ce5da
 +                process = stack.enter_context(windows_process(command, cwd=self.executable.parent,
 +                    env={**os.environ, 'CUDA_CACHE_PATH': str(cache)}, stdin=subprocess.DEVNULL, stdout=log, stderr=log))
 +                report_chat_stage('chat_loading')
-+                server = LlamaSession(f'http://127.0.0.1:{port}', key, process, cancel, deadline)
++                server = LlamaSession(f'http://127.0.0.1:{port}', key, process, cancel, deadline,
++                                      alias=self.alias, context=self.context)
 +                while True:
 +                    check_running(cancel, deadline)
 +                    if process.poll() is not None:
@@ -3162,13 +3205,44 @@ index 7b43f429b175b8c9e62936b7121a9327e18f4acf..2dd19b9f433489d908716f1a63826254
      path.parent.mkdir(parents=True, exist_ok=True)
      # The OS lock is automatically released if the process dies. Do not unlink:
      # another process may already have an open handle to the same file.
+diff --git a/scripts/learning/verify_qwen27_q8.py b/scripts/learning/verify_qwen27_q8.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8549526f87a4b6d9733661156bf49c52e04eaf67
+--- /dev/null
++++ b/scripts/learning/verify_qwen27_q8.py
+@@ -0,0 +1,24 @@
++"""Record the checksum of the pinned local Q8_0 GGUF without starting a model."""
++import hashlib
++
++from assistant import qwen27_engine as qwen
++from assistant.learning_batches import save
++
++
++def verify():
++    model = qwen.ASSETS / 'chat-q8' / qwen.Q8_NAME
++    before = qwen.identity(model)
++    if before[0] != qwen.Q8_SIZE:
++        raise ValueError('Q8_0 權重大小不符，請確認下載完成。')
++    with model.open('rb') as stream:
++        checksum = hashlib.file_digest(stream, 'sha256').hexdigest()
++    if checksum != qwen.Q8_SHA256 or qwen.identity(model) != before:
++        raise ValueError('Q8_0 權重的 SHA-256 不符或檔案在核對期間變更。')
++    save(qwen.ASSETS / 'chat-q8-verified.json', {
++        'file': qwen.Q8_NAME, 'size': before[0], 'sha256': checksum, 'mtime_ns': before[1],
++    })
++    return model
++
++
++if __name__ == '__main__':
++    print(verify())
 diff --git a/tests/test_html_chat.py b/tests/test_html_chat.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..009b41c928930b1791a471b30e23a21f5c6c45c2
+index 0000000000000000000000000000000000000000..c05fd20a5b348d70f6b698b20ef2a8212cd9d860
 --- /dev/null
 +++ b/tests/test_html_chat.py
-@@ -0,0 +1,988 @@
+@@ -0,0 +1,1065 @@
 +from contextlib import contextmanager, nullcontext
++import hashlib
 +import json
 +import os
 +from pathlib import Path
@@ -3183,15 +3257,17 @@ index 0000000000000000000000000000000000000000..009b41c928930b1791a471b30e23a21f
 +from urllib.error import HTTPError
 +from urllib.request import Request, urlopen
 +
-+from assistant import answer_runs, chat_drafts, chat_history, learning_batches, learning_queue, qwen27_learning
++from assistant import answer_runs, chat_drafts, chat_history, learning_batches, learning_queue, qwen27_engine, qwen27_learning
 +from assistant.backup import create_backup, restore_backup
 +from assistant.engine import Assistant, CodexEngine, EngineError, render_prompt_parts
 +from assistant.html_chat import ALIAS, MODEL_4B, ChatApp, server_for
 +from assistant.learning_batches import PhaseExit
 +from assistant.local_engine import LocalEngine
 +from assistant.owned_process import windows_process
-+from assistant.qwen27_engine import CONTEXT, LlamaSession, REPLY_TOKENS, Qwen27Engine, chat_prompt, generation_settings
++from assistant.qwen27_engine import (CONTEXT, Q8_ALIAS, Q8_CONTEXT, Q8_REVISION, REPLY_TOKENS, LlamaSession,
++                                     Qwen27Engine, chat_prompt, generation_settings)
 +from assistant.store import Store
++from scripts.learning.verify_qwen27_q8 import verify as verify_q8
 +from scripts.learning.runtime import (ModelPowerRequired, WebModelTask, chat_token_usage, consume_fit_ticket,
 +                                      fit_launch_ticket, gpu_lease, owned_web_process, report_chat_stage, report_chat_usage,
 +                                      require_web_model, web_model_task)
@@ -3475,6 +3551,80 @@ index 0000000000000000000000000000000000000000..009b41c928930b1791a471b30e23a21f
 +        self.assertIn(f'{limit + 37:,} tokens', str(caught.exception))
 +        self.assertIn(f'{limit:,} tokens', str(caught.exception))
 +        self.assertEqual(calls.call_count, 2)
++
++    def test_q8_requires_a_verified_asset_and_disables_it_after_file_changes(self):
++        root = self.store.path.parent
++        model = root / 'chat-q8' / qwen27_engine.Q8_NAME
++        model.parent.mkdir()
++        payload = b'fake Q8 weights'
++        model.write_bytes(payload)
++        with patch.multiple(qwen27_engine, ASSETS=root, Q8_SIZE=len(payload),
++                            Q8_SHA256=hashlib.sha256(payload).hexdigest()):
++            self.assertFalse(self.app.view(self.sid)['models'][Q8_ALIAS]['available'])
++            self.assertEqual(verify_q8(), model)
++            self.assertTrue(self.app.view(self.sid)['models'][Q8_ALIAS]['available'])
++            model.write_bytes(b'x' * len(payload))
++            changed = model.stat().st_mtime_ns + 1_000_000_000
++            os.utime(model, ns=(changed, changed))
++            self.assertFalse(self.app.view(self.sid)['models'][Q8_ALIAS]['available'])
++            with self.assertRaisesRegex(ValueError, 'SHA-256'):
++                verify_q8()
++
++    def test_q8_web_selection_uses_its_own_context_for_launch_and_token_budget(self):
++        root = self.store.path.parent
++        executable, weights = root / 'synthetic.exe', root / 'synthetic-q8.gguf'
++        executable.touch()
++        weights.touch()
++        process = Mock()
++        process.poll.return_value = None
++        token_limit = Q8_CONTEXT - REPLY_TOKENS - 4
++        response = {'choices': [{'finish_reason': 'stop', 'message': {'content': 'Q8 合成回覆'}}],
++                    'usage': {'prompt_tokens': token_limit, 'completion_tokens': 4}}
++        with (
++            patch('assistant.html_chat.Qwen27Engine', Qwen27Engine),
++            patch('assistant.html_chat.q8_assets_ready', return_value=True),
++            patch('assistant.qwen27_engine.model_assets', return_value=(executable, weights)) as assets,
++            patch('assistant.qwen27_engine.ASSETS', root),
++            patch('assistant.qwen27_engine.gpu_lease', return_value=nullcontext()),
++            patch('assistant.qwen27_engine.windows_process', return_value=nullcontext(process)) as spawn,
++            patch.object(LlamaSession, 'request', return_value={'status': 'ok'}),
++            patch.object(LlamaSession, 'query', side_effect=[{'prompt': 'mock'}, {'tokens': [1] * token_limit},
++                                                               response]) as query,
++        ):
++            app = ChatApp(self.store, controlled=True)
++            self.assertEqual(app.dispatch('select', {'model': Q8_ALIAS})['selection'], {'id': Q8_ALIAS, 'batch': None})
++            assets.assert_called_with(Q8_ALIAS)
++            self.assertEqual(app.view(self.sid)['models'][Q8_ALIAS], {
++                'label': 'Qwen3.8-27B Q8_0', 'context_tokens': Q8_CONTEXT, 'input_tokens': token_limit,
++                'output_tokens': REPLY_TOKENS, 'available': True,
++            })
++            self.assertEqual(ChatApp(self.store).model, Q8_ALIAS)
++            with web_model_task('training'), self.assertRaises(ModelPowerRequired):
++                app.engine.answer('訓練模式不得啟動 Q8_0。')
++            with self.assertRaisesRegex(ValueError, '使用模型開關'):
++                app.dispatch('ask', {'sid': self.sid, 'question': '請回答本輪合成問題。'})
++            spawn.assert_not_called()
++            app.change_mode('chat')
++            spawn.assert_not_called()
++            app.dispatch('ask', {'sid': self.sid, 'question': '請回答本輪合成問題。'})
++            app.worker.join(timeout=3)
++            self.assertEqual(app.status()['stage'], 'done')
++            self.assertEqual(spawn.call_count, 1)
++            command = spawn.call_args.args[0]
++            self.assertEqual(command[command.index('--ctx-size') + 1], str(Q8_CONTEXT))
++            self.assertEqual(command[command.index('--model') + 1], str(weights))
++            self.assertEqual(query.call_args.args[1]['model'], Q8_ALIAS)
++            self.assertEqual(query.call_args.args[1]['max_tokens'], REPLY_TOKENS)
++            row = app.view(self.sid)['messages'][-1]
++            self.assertEqual(row['source']['label'], 'Qwen3.8-27B Q8_0')
++            self.assertIn(Q8_REVISION, row['source']['detail'])
++            app.change_mode('off')
++
++        session = LlamaSession(None, None, None, None, None, alias=Q8_ALIAS, context=Q8_CONTEXT)
++        with patch.object(session, 'query', side_effect=[{'prompt': 'mock'}, {'tokens': [1] * (token_limit + 1)}]) as query:
++            with self.assertRaisesRegex(EngineError, f'{token_limit + 1:,} tokens'):
++                session.answer([])
++            self.assertEqual(query.call_count, 2)
 +
 +    def test_usage_is_omitted_when_any_chat_call_has_unavailable_counts(self):
 +        with web_model_task('chat'):

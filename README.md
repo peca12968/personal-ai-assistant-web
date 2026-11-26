@@ -3,7 +3,8 @@
 ASP.NET Core .NET 10、本機 IIS、HTML 介面。站台使用 127.0.0.1:18765，模型和 SQLite 保存在 F 槽個人助理專案。
 
 - 開機後首次開啟桌面捷徑時，使用模型和訓練都關閉。
-- 頁首可選擇 Qwen3.8-27B BF16 或 Qwen3-4B BF16，並查看每輪輸入和輸出的 token 上限。選擇會保存在本機，開關維持原來狀態。輸入額度含系統提示與帶入的對話，本機運行沒有服務商每日額度。
+- 頁首可選擇 Qwen3.8-27B BF16、Qwen3.8-27B Q8_0 或 Qwen3-4B BF16，並查看每輪輸入和輸出的 token 上限。Q8_0 的上下文為 16,384 tokens，每輪輸入最多 15,868 tokens，回覆最多 512 tokens。選擇會保存在本機，開關維持原來狀態。輸入額度含系統提示與帶入的對話，本機運行沒有服務商每日額度。
+- Q8_0 用於聊天，LoRA 微調及候選仍使用 BF16。重新安裝時，把釘選的 Q8_0 GGUF 放入核心專案的 `data/learning/experiments/qwen38-bf16-rtx5080/chat-q8`，在核心目錄執行 `.\.venv\Scripts\python.exe -m scripts.learning.verify_qwen27_q8`，完成 SHA-256 核對後重新整理網頁。[Q8_0 權重版本](https://huggingface.co/bartowski/Qwen3.8-27B-GGUF/blob/419d4bf0b4841d3517a2a15a70465abdf655281c/Qwen3.8-27B-Q8_0.gguf)
 - 開啟「使用模型」後可聊天。開啟「訓練」後，選確認更正和未見驗收問答，再安排閒置微調。
 - 重新開啟「本機模型學習」可查看上次中斷的階段。仍有效的已確認更正可選入新批次。
 - 微調前後的驗收共用目前 27B 網頁聊天設定。舊批次仍可查看，適配器需通過目前設定的驗收才可選用。
