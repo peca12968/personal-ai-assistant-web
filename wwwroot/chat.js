@@ -7,6 +7,7 @@ if (fragment.has('key')) {
 }
 let connected = false;
 let sid = null;
+let retryAttempt = null;
 let correctionTarget = null;
 let correctionOpening = 0;
 let learningRequest = 0;
@@ -166,10 +167,14 @@ function busyState() {
   $('stop-learning').hidden = !(job?.running && job.kind === 'learning');
   $('start-learning').disabled = !connected || inProgress || mode !== 'training';
 }
-function messageNode(row, sourceSid) {
+function messageNode(row, sourceSid, retry = null) {
   const article = element('article', undefined, 'message ' + row.role);
   article.append(element('div', row.role === 'user' ? '你' : '助理', 'speaker'));
   article.append(element('p', row.content));
+  if (retry && row.role === 'user' && row.id === retry.user_message_id) {
+    const reason = {cancelled: '回答已停止', interrupted: '回答曾中斷', failed: '回答未完成'}[retry.status];
+    article.append(element('small', reason + ' · 可重試', 'message-state'));
+  }
   if (row.correctable) {
     article.append(action('更正這則回答', () => openCorrection(sourceSid, row.id)));
   }
@@ -199,7 +204,7 @@ async function openCorrection(sourceSid, id) {
     if (opening === correctionOpening && sid === sourceSid) showStatus(error.message);
   }
 }
-async function load(targetSid = sid) {
+async function load(targetSid = sid, confirmed = null) {
   if (preparingDraft) return;
   const revision = ++viewRevision;
   const powerAtRequest = powerRevision;
@@ -212,7 +217,10 @@ async function load(targetSid = sid) {
     const state = await api('view' + (targetSid ? '?sid=' + encodeURIComponent(targetSid) : ''));
     if (revision !== viewRevision) return;
     connected = true;
+    const justSubmitted = confirmed && draftSubmission === confirmed && state.sid === confirmed.sid;
+    if (justSubmitted) draftSubmission = null;
     showView(state, powerAtRequest, modelAtRequest);
+    if (justSubmitted && !state.draft.content) draftNotice('訊息已送出');
   } catch (error) {
     if (revision === viewRevision) throw error;
   } finally {
@@ -224,6 +232,7 @@ async function load(targetSid = sid) {
 }
 function showView(state, powerAtRequest, modelAtRequest) {
   sid = state.sid;
+  retryAttempt = state.retry;
   acknowledgeDraft(draftSubmission?.sid === sid ? draftSubmission.snapshot : state.draft);
   historyCursor = state.before;
   if (!switching && powerAtRequest === powerRevision) mode = state.mode;
@@ -241,9 +250,9 @@ function showView(state, powerAtRequest, modelAtRequest) {
     button.title = row.title;
     return button;
   }));
-  $('messages').replaceChildren(...state.messages.map(row => messageNode(row, state.sid)));
+  $('messages').replaceChildren(...state.messages.map(row => messageNode(row, state.sid, retryAttempt)));
   $('history').scrollTop = $('history').scrollHeight;
-  $('retry').hidden = !state.can_retry;
+  $('retry').hidden = !retryAttempt;
 }
 $('older-messages').addEventListener('click', async () => {
   if (viewLoading || olderLoading || !historyCursor) return;
@@ -288,30 +297,39 @@ async function poll() {
     job = await api('status');
     if (!switching && powerAtRequest === powerRevision) mode = job.mode;
     if (!selecting && modelAtRequest === modelRevision) showModel(job.selection);
-    const state = job.stage ? stages[job.stage] || job.stage : '';
-    const finishedDraft = !viewLoading && draftSubmission && !job.running && job.id === draftSubmission.id ? draftSubmission : null;
-    if (finishedDraft) {
+    const state = job.running && job.draft_submitted === false ? '正在整理輸入與對話背景' :
+      (job.stage ? stages[job.stage] || job.stage : '');
+    const submitted = !viewLoading && job.id === draftSubmission?.id ? draftSubmission : null;
+    let refreshed = false;
+    if (submitted && job.draft_submitted === true) {
+      if (sid === submitted.sid) {
+        await load(submitted.sid, submitted);
+        refreshed = draftSubmission !== submitted;
+      } else {
+        draftSubmission = null;
+      }
+    } else if (submitted && !job.running) {
       draftSubmission = null;
-      if (sid === finishedDraft.sid && !viewLoading) {
-        if (job.draft_submitted === true) {
-          acknowledgeDraft({revision: finishedDraft.snapshot.revision + 1, content: ''});
-        } else {
-          try {
-            const saved = await api('draft?sid=' + encodeURIComponent(sid));
-            if (sid === finishedDraft.sid && !viewLoading && saved.revision !== finishedDraft.snapshot.revision) {
+      if (sid === submitted.sid) {
+        try {
+          const saved = await api('draft?sid=' + encodeURIComponent(sid));
+          if (sid === submitted.sid && !viewLoading) {
+            if (saved.revision !== submitted.snapshot.revision) {
               flagDraftError(Object.assign(new Error('本次草稿未確認送出，請先核對並選擇要保留的版本。'), {status:409}));
+            } else {
+              draftNotice('訊息尚未送出，草稿已保存');
             }
-          } catch (error) { flagDraftError(error); }
-        }
+          }
+        } catch (error) { flagDraftError(error); }
       }
     }
-    if (job.id && (job.running || lastJob !== job.id || finishedDraft)) {
+    if (job.id && (job.running || lastJob !== job.id || submitted)) {
       const notice = [state, job.error].filter(Boolean).join(' · ');
       showStatus(notice);
       if (job.kind === 'learning') $('learning-status').textContent = notice;
       if (!job.running) {
         lastJob = job.id;
-        if (!viewLoading) await load();
+        if (!viewLoading && !refreshed) await load();
         if ($('learning-dialog').open) await learningData();
       }
     }
@@ -331,6 +349,9 @@ async function start(route, data) {
     return job;
   } catch (error) {
     if (route === 'ask' && error.status === 409) flagDraftError(error);
+    if (route === 'retry' && error.status === 409 && sid === data.sid && !viewLoading) {
+      await load(data.sid).catch(() => {});
+    }
     showStatus(error.message);
     return false;
   } finally {
@@ -413,7 +434,9 @@ $('question').addEventListener('keydown', event => {
     $('chat-form').requestSubmit();
   }
 });
-$('retry').addEventListener('click', () => start('retry', {sid, expected_model: selection}));
+$('retry').addEventListener('click', () => {
+  if (retryAttempt) start('retry', {sid, expected_run_id: retryAttempt.id, expected_model: selection});
+});
 $('new-chat').addEventListener('click', async () => {
   try {
     if (!(await flushDraft())) return;
