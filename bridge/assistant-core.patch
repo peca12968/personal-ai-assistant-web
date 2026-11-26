@@ -1840,7 +1840,7 @@ index 0000000000000000000000000000000000000000..e4eb5a10dc46324b1b090f690f31e8a7
 +        api.CloseHandle(job)
 diff --git a/assistant/qwen27_engine.py b/assistant/qwen27_engine.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..6255f435b5355ddfe93728fec2eda3d641209803
+index 0000000000000000000000000000000000000000..d84874b91812d6a6ba147e3707a008c887fa2ebf
 --- /dev/null
 +++ b/assistant/qwen27_engine.py
 @@ -0,0 +1,363 @@
@@ -1941,7 +1941,7 @@ index 0000000000000000000000000000000000000000..6255f435b5355ddfe93728fec2eda3d6
 +        question = context['current_request']
 +        if question.strip().casefold() not in CONNECTION_PROBES or not is_iis_chat(context):
 +            return None
-+        if any(context.get(key) for key in ('session_brief', 'memories', 'earlier_user_excerpts', 'image_inputs', 'task_runs',
++        if any(context.get(key) for key in ('session_brief', 'memories', 'image_inputs', 'task_runs',
 +                                           'named_topic', 'decision_sources', '本輪接續', 'retry_of')):
 +            return None
 +        if (any(context.get('documents', {}).values()) or any(context.get('autonomous_goals', {}).values())
@@ -1951,7 +1951,7 @@ index 0000000000000000000000000000000000000000..6255f435b5355ddfe93728fec2eda3d6
 +        history = context.get('recent_conversation', ())
 +        if history and history[-1]['role'] == 'assistant' and history[-1]['content'].rstrip().endswith(('?', '？')):
 +            return None
-+        for row in history:
++        for row in (*history, *context.get('earlier_user_excerpts', ())):
 +            if row['role'] != 'user':
 +                continue
 +            content = row['content']
@@ -3576,10 +3576,10 @@ index 0000000000000000000000000000000000000000..8549526f87a4b6d9733661156bf49c52
 +    print(verify())
 diff --git a/tests/test_html_chat.py b/tests/test_html_chat.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..989d9aa78edbec83bf3717fdfe9f2eb40fd71d90
+index 0000000000000000000000000000000000000000..8b5eabc07f98a7052ad961d6939f30d16f283082
 --- /dev/null
 +++ b/tests/test_html_chat.py
-@@ -0,0 +1,1442 @@
+@@ -0,0 +1,1453 @@
 +from contextlib import contextmanager, nullcontext
 +import hashlib
 +from io import BytesIO
@@ -4213,6 +4213,17 @@ index 0000000000000000000000000000000000000000..989d9aa78edbec83bf3717fdfe9f2eb4
 +        other = self.store.new_session()
 +        self.store.add_message(other, 'user', '下一則請只回一個英文字。')
 +        self.assertIn('下一則請只回一個英文字', messages('test', other)[1]['content'])
++
++        for opening, expected_brief in (('你有辦法寫程式碼嗎？', True), ('輸入 test 就依照上一段規格驗證。', False)):
++            with self.subTest(expected_brief=expected_brief):
++                longer = self.store.new_session()
++                self.store.add_message(longer, 'user', opening)
++                for index in range(9):
++                    self.store.add_message(longer, 'user', '請說明這項本機能力。')
++                    self.store.add_message(longer, 'assistant', '已說明第 ' + str(index + 1) + ' 項。')
++                context = self.app.driver.prepare_context(longer, 'test')
++                self.assertIn(opening, [row['content'] for row in context['earlier_user_excerpts']])
++                self.assertEqual(messages('test', longer)[1]['content'] == 'test', expected_brief)
 +
 +    def test_27b_load_progress_uses_bound_server_events_and_clears_after_readiness(self):
 +        root = self.store.path.parent
