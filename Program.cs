@@ -14,11 +14,11 @@ builder.Services.AddHttpClient("localBridge", client => client.Timeout = TimeSpa
     });
 var app = builder.Build();
 var runtimePath = Path.GetFullPath(app.Configuration["RuntimePath"] ?? "runtime", app.Environment.ContentRootPath);
-var readable = new HashSet<string> { "view", "status", "learning", "trash" };
+var readable = new HashSet<string> { "view", "status", "learning", "trash", "draft" };
 var writable = new HashSet<string>
 {
     "new", "ask", "retry", "confirm", "withdraw", "learn", "stop", "select",
-    "mode", "trash", "restore", "purge", "connect"
+    "mode", "trash", "restore", "purge", "connect", "draft"
 };
 
 app.Use(async (context, next) =>
@@ -76,11 +76,11 @@ app.MapMethods("/api/{operation}", new[] { "GET", "POST" }, async (
         return;
     }
 
-    const int maxBody = 128 * 1024;
+    var maxBody = operation == "draft" ? 6 * 64000 + 256 : 128 * 1024;
     var size = request.ContentLength ?? 0;
     if (!read && (size < 1 || size > maxBody || !request.HasJsonContentType()))
     {
-        await Error(http, StatusCodes.Status400BadRequest, "本機操作需要 128 KiB 以內的 JSON。");
+        await Error(http, StatusCodes.Status400BadRequest, "請傳送符合大小限制的 JSON。");
         return;
     }
 

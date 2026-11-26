@@ -34,7 +34,11 @@
       <p id="status" role="status"></p>
       <form id="chat-form">
         <label class="sr-only" for="question">輸入訊息</label>
-        <textarea id="question" rows="3" maxlength="16000" placeholder="輸入訊息…" required></textarea>
+        <textarea id="question" rows="3" maxlength="64000" placeholder="輸入訊息…" required></textarea>
+        <div class="draft-actions">
+          <span id="draft-status" role="status"></span>
+          <button type="button" id="draft-review" hidden>核對草稿</button>
+        </div>
         <div class="compose-actions">
           <button type="button" id="retry" hidden>重試上輪</button>
           <span class="shortcut">Ctrl + Enter 送出</span>
@@ -44,6 +48,15 @@
       </form>
     </section>
   </main>
+  <dialog id="draft-dialog">
+    <div class="dialog-title"><h2>核對聊天草稿</h2><button type="button" data-close="draft-dialog" aria-label="關閉">×</button></div>
+    <label for="draft-editor-copy">目前輸入</label>
+    <textarea id="draft-editor-copy" rows="5" readonly></textarea>
+    <label for="draft-saved-copy">本機已保存</label>
+    <textarea id="draft-saved-copy" rows="5" readonly></textarea>
+    <p id="draft-review-status" class="dialog-status" role="status"></p>
+    <div class="dialog-actions"><button id="draft-use-saved" type="button">採用本機版本</button><button id="draft-keep-editor" type="button" class="primary">保留目前輸入</button></div>
+  </dialog>
   <dialog id="trash-dialog">
     <div class="dialog-title"><h2>歷史回收筒</h2><button type="button" data-close="trash-dialog" aria-label="關閉">×</button></div>
     <div id="trash-items"></div>

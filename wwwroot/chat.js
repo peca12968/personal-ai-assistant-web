@@ -19,6 +19,13 @@ let mode = 'off';
 let switching = false;
 let requestedMode = null;
 let powerRevision = 0;
+let draftBase = null;
+let draftTimer = null;
+let draftWrite = null;
+let draftConflict = false;
+let draftReview = null;
+let draftSubmission = null;
+let preparingDraft = false;
 
 async function api(route, data) {
   const headers = token ? {Authorization: 'Bearer ' + token} : {};
@@ -35,7 +42,9 @@ async function api(route, data) {
       $('connect-notice').textContent = '此分頁尚未連線。請從桌面「個人助理對話」開啟一次。';
       busyState();
     }
-    throw new Error(payload.error || ('本機網站回報 HTTP ' + response.status + '。'));
+    const error = new Error(payload.error || ('本機網站回報 HTTP ' + response.status + '。'));
+    error.status = response.status;
+    throw error;
   }
   return payload;
 }
@@ -52,10 +61,63 @@ function action(text, fn, css) {
   return button;
 }
 function showStatus(text) { $('status').textContent = text; }
+function draftNotice(text) { $('draft-status').textContent = text; }
+function hasDraftEdit() { return draftBase && $('question').value !== draftBase.content; }
+function acknowledgeDraft(snapshot) {
+  draftBase = snapshot;
+  draftConflict = false;
+  $('question').value = snapshot.content;
+  draftNotice(snapshot.content ? '草稿已存本機' : '');
+}
+function flagDraftError(error) {
+  if (error.status === 409) draftConflict = true;
+  draftNotice(error.message);
+  busyState();
+}
+function queueDraft() {
+  clearTimeout(draftTimer);
+  if (!draftConflict && hasDraftEdit()) {
+    draftNotice('草稿尚未保存…');
+    draftTimer = setTimeout(() => flushDraft(), 350);
+  }
+}
+async function flushDraft() {
+  clearTimeout(draftTimer);
+  while (draftWrite) {
+    if (!(await draftWrite)) return false;
+  }
+  if (draftConflict) return false;
+  if (!hasDraftEdit()) return true;
+  if (!connected || !sid) return false;
+  const text = $('question').value;
+  draftWrite = (async () => {
+    try {
+      draftBase = await api('draft', {sid, revision: draftBase.revision, content: text});
+      draftNotice(text ? '草稿已存本機' : '');
+      return true;
+    } catch (error) {
+      flagDraftError(error);
+      return false;
+    } finally {
+      draftWrite = null;
+    }
+  })();
+  if (!(await draftWrite)) return false;
+  if (hasDraftEdit()) {
+    if (viewLoading || preparingDraft) return flushDraft();
+    queueDraft();
+    return false;
+  }
+  return true;
+}
 function busyState() {
-  const inProgress = pending || switching || Boolean(job && job.running);
+  const inProgress = pending || preparingDraft || switching || Boolean(job && job.running);
   $('connect-notice').hidden = connected;
-  $('send').disabled = $('retry').disabled = !connected || inProgress || viewLoading || mode !== 'chat';
+  $('send').disabled = !connected || inProgress || viewLoading || draftConflict || mode !== 'chat';
+  $('retry').disabled = !connected || inProgress || viewLoading || mode !== 'chat';
+  $('question').readOnly = !connected || viewLoading || preparingDraft || draftSubmission?.sid === sid;
+  $('draft-review').hidden = !draftConflict;
+  $('draft-review').disabled = !connected || viewLoading || preparingDraft || draftSubmission?.sid === sid;
   $('new-chat').disabled = !connected || inProgress;
   $('trash-current').disabled = !connected || inProgress || viewLoading;
   $('trash-list').disabled = $('learning').disabled = !connected;
@@ -88,12 +150,14 @@ function messageNode(row, sourceSid) {
   return article;
 }
 async function load(targetSid = sid) {
+  if (preparingDraft) return;
   const revision = ++viewRevision;
   const powerAtRequest = powerRevision;
   viewLoading = true;
   olderLoading = false;
   busyState();
   try {
+    if (!(await flushDraft()) || revision !== viewRevision) return;
     const state = await api('view' + (targetSid ? '?sid=' + encodeURIComponent(targetSid) : ''));
     if (revision !== viewRevision) return;
     connected = true;
@@ -109,6 +173,7 @@ async function load(targetSid = sid) {
 }
 function showView(state, powerAtRequest) {
   sid = state.sid;
+  acknowledgeDraft(draftSubmission?.sid === sid ? draftSubmission.snapshot : state.draft);
   historyCursor = state.before;
   if (!switching && powerAtRequest === powerRevision) mode = state.mode;
   busyState();
@@ -170,7 +235,23 @@ async function poll() {
     job = await api('status');
     if (!switching && powerAtRequest === powerRevision) mode = job.mode;
     const state = job.stage ? stages[job.stage] || job.stage : '';
-    if (job.id && (job.running || lastJob !== job.id)) {
+    const finishedDraft = !viewLoading && draftSubmission && !job.running && job.id === draftSubmission.id ? draftSubmission : null;
+    if (finishedDraft) {
+      draftSubmission = null;
+      if (sid === finishedDraft.sid && !viewLoading) {
+        if (job.draft_submitted === true) {
+          acknowledgeDraft({revision: finishedDraft.snapshot.revision + 1, content: ''});
+        } else {
+          try {
+            const saved = await api('draft?sid=' + encodeURIComponent(sid));
+            if (sid === finishedDraft.sid && !viewLoading && saved.revision !== finishedDraft.snapshot.revision) {
+              flagDraftError(Object.assign(new Error('本次草稿未確認送出，請先核對並選擇要保留的版本。'), {status:409}));
+            }
+          } catch (error) { flagDraftError(error); }
+        }
+      }
+    }
+    if (job.id && (job.running || lastJob !== job.id || finishedDraft)) {
       const notice = [state, job.error].filter(Boolean).join(' · ');
       showStatus(notice);
       if (job.kind === 'learning') $('learning-status').textContent = notice;
@@ -193,8 +274,9 @@ async function start(route, data) {
   try {
     job = await api(route, data);
     showStatus(stages[job.stage] || '');
-    return true;
+    return job;
   } catch (error) {
+    if (route === 'ask' && error.status === 409) flagDraftError(error);
     showStatus(error.message);
     return false;
   } finally {
@@ -205,14 +287,68 @@ async function start(route, data) {
 $('chat-form').addEventListener('submit', async event => {
   event.preventDefault();
   const question = $('question').value.trim();
-  if (!connected || !question || pending || viewLoading || job?.running || mode !== 'chat') return;
+  if (!connected || !question || pending || preparingDraft || draftConflict || viewLoading || job?.running || mode !== 'chat') return;
+  if ([...question].length > 16000) {
+    draftNotice('訊息最多 16000 字，請先縮短。');
+    return;
+  }
   const sourceSid = sid;
-  if (await start('ask', {sid: sourceSid, question})) {
-    $('question').value = '';
-    if (sid === sourceSid && !viewLoading) {
-      $('messages').append(messageNode({role: 'user', content: question}, sourceSid));
-      $('history').scrollTop = $('history').scrollHeight;
+  preparingDraft = true;
+  busyState();
+  try {
+    if (!(await flushDraft()) || sid !== sourceSid || viewLoading) return;
+    const snapshot = draftBase;
+    const accepted = await start('ask', {sid: sourceSid, question, draft_revision: snapshot.revision});
+    if (accepted) {
+      draftSubmission = {id: accepted.id, sid: sourceSid, snapshot};
+      if (sid === sourceSid) draftNotice('正在等候送出確認…');
     }
+  } finally {
+    preparingDraft = false;
+    busyState();
+  }
+});
+$('question').addEventListener('input', queueDraft);
+$('draft-review').addEventListener('click', async () => {
+  const sourceSid = sid;
+  try {
+    const saved = await api('draft?sid=' + encodeURIComponent(sourceSid));
+    if (sourceSid !== sid || viewLoading || preparingDraft) return;
+    draftReview = {sid: sourceSid, editor: $('question').value, saved};
+    $('draft-editor-copy').value = draftReview.editor;
+    $('draft-saved-copy').value = saved.content;
+    $('draft-review-status').textContent = '';
+    $('draft-dialog').showModal();
+  } catch (error) { flagDraftError(error); }
+});
+async function resolveDraft(keepEditor) {
+  const review = draftReview;
+  if (!review || review.sid !== sid || review.editor !== $('question').value) return;
+  $('draft-use-saved').disabled = $('draft-keep-editor').disabled = true;
+  try {
+    const snapshot = keepEditor
+      ? await api('draft', {sid, revision: review.saved.revision, content: review.editor})
+      : await api('draft?sid=' + encodeURIComponent(sid));
+    if (!keepEditor && snapshot.revision !== review.saved.revision) {
+      throw new Error('本機版本已再次變更，請關閉後重新核對。');
+    }
+    if (review.sid === sid && review.editor === $('question').value) {
+      acknowledgeDraft(snapshot);
+      $('draft-dialog').close();
+      busyState();
+    }
+  } catch (error) {
+    $('draft-review-status').textContent = error.message;
+  } finally {
+    $('draft-use-saved').disabled = $('draft-keep-editor').disabled = false;
+  }
+}
+$('draft-use-saved').addEventListener('click', () => resolveDraft(false));
+$('draft-keep-editor').addEventListener('click', () => resolveDraft(true));
+window.addEventListener('beforeunload', event => {
+  if (hasDraftEdit() || draftConflict) {
+    event.preventDefault();
+    event.returnValue = '';
   }
 });
 $('question').addEventListener('keydown', event => {
@@ -224,6 +360,7 @@ $('question').addEventListener('keydown', event => {
 $('retry').addEventListener('click', () => start('retry', {sid}));
 $('new-chat').addEventListener('click', async () => {
   try {
+    if (!(await flushDraft())) return;
     const created = (await api('new', {})).sid;
     $('sidebar').classList.remove('open');
     await load(created);
@@ -334,6 +471,7 @@ $('trash-current').addEventListener('click', async () => {
   const sourceSid = sid;
   if (!sourceSid || viewLoading || !confirm('將目前對話移到回收筒？之後可以還原。')) return;
   try {
+    if (!(await flushDraft()) || sid !== sourceSid || viewLoading) return;
     await api('trash', {sid: sourceSid});
     if (!viewLoading) await load(sid === sourceSid ? null : sid);
   }
