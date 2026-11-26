@@ -17,3 +17,4 @@ dialog{width:min(600px,calc(100% - 25px));max-height:88dvh;overflow:auto;backgro
 .message-state{display:block;margin-top:6px;color:var(--muted);font-size:.8rem}
 .composer .stage-time{font-size:.8rem;font-variant-numeric:tabular-nums}
 .message-source summary{cursor:pointer}.source-detail{margin:0 0 7px;color:var(--muted);font-size:.78rem;white-space:pre-wrap;overflow-wrap:anywhere}
+#correction-dialog .dialog-actions{flex-wrap:wrap}

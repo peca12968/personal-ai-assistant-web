@@ -448,10 +448,10 @@ index 78bfad433d1abe8c476e44d04bc20f8b5c167020..a96dfd9638c9157c10c256798bad45e1
                  "excerpt_ids": [row["message_id"] for row in context["earlier_user_excerpts"]],
 diff --git a/assistant/html_chat.py b/assistant/html_chat.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..43ed701c1d5931462a78f8562d5cd10a2d9ca562
+index 0000000000000000000000000000000000000000..998699d5883c9d2d647801056585cc8974130ac2
 --- /dev/null
 +++ b/assistant/html_chat.py
-@@ -0,0 +1,624 @@
+@@ -0,0 +1,643 @@
 +"""F-drive HTML desktop client for the existing local assistant and 27B runner."""
 +import argparse
 +from contextlib import contextmanager
@@ -787,10 +787,14 @@ index 0000000000000000000000000000000000000000..43ed701c1d5931462a78f8562d5cd10a
 +        version = learning_queue.digest({'sid': sid, 'message_id': message_id, 'reply': dict(row),
 +                                         'example': entry['fingerprint'] if entry else None})
 +        state = learning_queue.observed(self.store, db, entry)['readiness'] if entry else 'new'
++        can_withdraw = state == 'ready' or (state == 'withdrawn' and learning_queue.source_current(self.store, db, entry['source']))
 +        saved_answer = row['correction'] if row['rating'] == -1 else ''
-+        if entry and state != 'needs_review':
++        if can_withdraw or (state == 'withdrawn' and not saved_answer):
 +            question, saved_answer = entry['prompt'], entry['answer']
-+        return {'version': version, 'state': state, 'prompt': question[:2000], 'answer': saved_answer or ''}, entry
++        elif state == 'withdrawn':
++            state = 'needs_review'
++        return {'version': version, 'state': state, 'prompt': question[:2000], 'answer': saved_answer or '',
++                'can_withdraw': can_withdraw}, entry
 +
 +    def confirm(self, body):
 +        message_id, sid = body['message_id'], body['sid']
@@ -806,6 +810,19 @@ index 0000000000000000000000000000000000000000..43ed701c1d5931462a78f8562d5cd10a
 +            options = {'item_id': previous['id'], 'expected_revision': previous['revision']} if previous else {}
 +            entry = learning_queue.confirm(self.store, prompt, answer, source=source, db=db, **options)
 +            return {'id': entry['id'], 'revision': entry['revision']}
++
++    def withdraw_correction(self, body):
++        message_id, sid = body['message_id'], body['sid']
++        with self.store.connect() as db:
++            db.execute('BEGIN IMMEDIATE')
++            snapshot, entry = self.correction_snapshot(db, sid, message_id)
++            if body.get('version') != snapshot['version']:
++                raise CorrectionConflict('更正已改版或撤回。請核對本機版本後再操作。')
++            if not snapshot['can_withdraw']:
++                raise ValueError('目前沒有與這筆確認例子相符的有效更正。')
++            learning_queue.withdraw(self.store, entry['id'], entry['revision'], db=db)
++            self.store.rate(message_id, -1, '', db=db)
++            return {'state': 'withdrawn'}
 +
 +    def learning(self):
 +        with self.store.connect() as db:
@@ -857,6 +874,8 @@ index 0000000000000000000000000000000000000000..43ed701c1d5931462a78f8562d5cd10a
 +            return {'stopping': True}
 +        if route == 'confirm':
 +            return self.confirm(body)
++        if route == 'withdraw-correction':
++            return self.withdraw_correction(body)
 +        if route == 'draft':
 +            return self.draft(body['sid'], body)
 +        if route == 'withdraw':
@@ -1124,7 +1143,7 @@ index 0000000000000000000000000000000000000000..646349946f4e39360caa703b0a166eae
 +if __name__ == '__main__':
 +    main()
 diff --git a/assistant/learning_queue.py b/assistant/learning_queue.py
-index d7493f3dc1a97a0185afae16d6019af6c85ac21d..9416c8b185754d47e47a51072d75c1cece0c0756 100644
+index d7493f3dc1a97a0185afae16d6019af6c85ac21d..fb0a4c7b0eacace72cba8a7b154b0318a86bb1ce 100644
 --- a/assistant/learning_queue.py
 +++ b/assistant/learning_queue.py
 @@ -1,4 +1,5 @@
@@ -1150,6 +1169,21 @@ index d7493f3dc1a97a0185afae16d6019af6c85ac21d..9416c8b185754d47e47a51072d75c1ce
          old = None
          if item_id is not None:
              old = latest(db, item_id)
+@@ -190,9 +193,11 @@ def confirm(store, prompt, answer, *, source=None, item_id=None, expected_revisi
+         return observed(store, db, value)
+ 
+ 
+-def withdraw(store, item_id, expected_revision):
+-    with store.connect() as db:
+-        db.execute('BEGIN IMMEDIATE')
++def withdraw(store, item_id, expected_revision, *, db=None):
++    owns_transaction = db is None
++    with (store.connect() if owns_transaction else nullcontext(db)) as db:
++        if owns_transaction:
++            db.execute('BEGIN IMMEDIATE')
+         old = latest(db, item_id)
+         if type(expected_revision) is not int or old['revision'] != expected_revision:
+             raise ValueError('項目已變更，請重新核對後撤回。')
 diff --git a/assistant/local_chat_budget.py b/assistant/local_chat_budget.py
 index 77c78778edc571cdf84d6ac1c47b79ef90ce67e4..44996a15b7f4ac66314f334e1fb901ebc09b52d9 100644
 --- a/assistant/local_chat_budget.py
@@ -3319,10 +3353,10 @@ index 0000000000000000000000000000000000000000..8549526f87a4b6d9733661156bf49c52
 +    print(verify())
 diff --git a/tests/test_html_chat.py b/tests/test_html_chat.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..0996f6e7a8f9c1871a82f3aca1f8865d2f713659
+index 0000000000000000000000000000000000000000..110ca474f812cc233564f78c1901ac1c583896ed
 --- /dev/null
 +++ b/tests/test_html_chat.py
-@@ -0,0 +1,1195 @@
+@@ -0,0 +1,1271 @@
 +from contextlib import contextmanager, nullcontext
 +import hashlib
 +from io import BytesIO
@@ -3431,6 +3465,82 @@ index 0000000000000000000000000000000000000000..0996f6e7a8f9c1871a82f3aca1f8865d
 +            self.assertEqual(call(path)['answer'], '交給乙。')
 +            self.assertEqual(call('status')['mode'], 'off')
 +            self.assertEqual(call('learning')['examples'][0]['revision'], 3)
++
++    def test_web_correction_withdrawal_updates_chat_and_learning_and_survives_restore(self):
++        question = '木箱交給哪個工作組？'
++        answer = self.store.add_answer(self.sid, '交給丙組。', {'current_request': question})
++        unrelated = self.store.add_answer(self.sid, '附件用紙本。', {'current_request': '附件使用什麼格式？'})
++        self.store.rate(unrelated, -1, '附件一律用 PDF。')
++
++        def visible(app):
++            context = app.driver.prepare_context(self.sid, '請核對木箱的工作組和附件格式。')
++            return {item['answer_message_id']: item['correction'] for item in context['answer_feedback']['items']}
++
++        with server_for(self.app) as (address, token):
++            def submit(route, body):
++                req = Request(address + '/api/' + route, data=json.dumps(body).encode(), headers={
++                    'Authorization': 'Bearer ' + token, 'Origin': address, 'Content-Type': 'application/json',
++                })
++                with urlopen(req, timeout=5) as response:
++                    return json.load(response)
++
++            def target():
++                return {'sid': self.sid, 'message_id': answer, 'version': self.app.correction(self.sid, answer)['version']}
++
++            item = submit('confirm', {**target(), 'prompt': question, 'answer': '交給甲組。'})
++            self.assertEqual(visible(self.app), {unrelated: '附件一律用 PDF。', answer: '交給甲組。'})
++            with patch.object(self.store, 'rate', side_effect=ValueError('synthetic feedback write failed')):
++                with self.assertRaises(HTTPError) as failed:
++                    submit('withdraw-correction', target())
++                self.assertEqual(failed.exception.code, 400)
++            self.assertEqual(learning_queue.get(self.store, item['id'])['readiness'], 'ready')
++            self.assertIn(answer, visible(self.app))
++
++            before_removal = target()
++            submit('withdraw', item)
++            self.assertIn(answer, visible(self.app))
++            self.assertTrue(self.app.correction(self.sid, answer)['can_withdraw'])
++            with self.assertRaises(HTTPError) as stale:
++                submit('withdraw-correction', before_removal)
++            self.assertEqual(stale.exception.code, 409)
++            self.assertEqual(submit('withdraw-correction', target()), {'state': 'withdrawn'})
++            self.assertEqual(visible(self.app), {unrelated: '附件一律用 PDF。'})
++            self.assertFalse(self.app.correction(self.sid, answer)['can_withdraw'])
++            self.assertEqual(self.app.learning()['examples'], [])
++            self.assertEqual(self.app.status()['mode'], 'off')
++
++            archive = create_backup(self.store.path)
++            folder = self.store.path.parent / 'restored-withdrawal'
++            restore_backup(archive['path'], folder)
++            restored = Store(folder / 'assistant.sqlite3')
++            self.assertEqual(visible(ChatApp(restored)), {unrelated: '附件一律用 PDF。'})
++            history = learning_queue.history(restored, item['id'])['items']
++            self.assertEqual([(r['status'], r['answer']) for r in history],
++                             [('withdrawn', '交給甲組。'), ('confirmed', '交給甲組。')])
++
++            new = submit('confirm', {**target(), 'prompt': question, 'answer': '改交乙組。'})
++            self.assertEqual(new['revision'], 3)
++            self.assertEqual(visible(self.app), {unrelated: '附件一律用 PDF。', answer: '改交乙組。'})
++
++    def test_web_withdrawal_preserves_new_feedback_from_another_entry_point(self):
++        question = '紙本檔案送往哪裡？'
++        message_id = self.store.add_answer(self.sid, '交給中控。', {'current_request': question})
++        target = {'sid': self.sid, 'message_id': message_id}
++        initial = self.app.correction(self.sid, message_id)
++        row = self.app.confirm({**target, 'version': initial['version'], 'prompt': question, 'answer': '交給甲組。'})
++        previous = self.app.correction(self.sid, message_id)
++        self.app.dispatch('withdraw', row)
++        self.store.rate(message_id, -1, '本次改交乙組。')
++        with self.assertRaisesRegex(ValueError, '改版或撤回'):
++            self.app.withdraw_correction({**target, 'version': previous['version']})
++        current = self.app.correction(self.sid, message_id)
++        self.assertFalse(current['can_withdraw'])
++        self.assertEqual(current['state'], 'needs_review')
++        self.assertEqual(current['answer'], '本次改交乙組。')
++        with self.assertRaisesRegex(ValueError, '相符的有效更正'):
++            self.app.withdraw_correction({**target, 'version': current['version']})
++        context = self.app.driver.prepare_context(self.sid, question)
++        self.assertEqual(context['answer_feedback']['items'][0]['correction'], '本次改交乙組。')
 +
 +    def test_api_requires_key_and_matching_origin(self):
 +        with server_for(self.app) as (address, token):

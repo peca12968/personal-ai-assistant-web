@@ -17,7 +17,7 @@ var runtimePath = Path.GetFullPath(app.Configuration["RuntimePath"] ?? "runtime"
 var readable = new HashSet<string> { "view", "status", "learning", "trash", "draft", "correction" };
 var writable = new HashSet<string>
 {
-    "new", "ask", "retry", "confirm", "withdraw", "learn", "stop", "select",
+    "new", "ask", "retry", "confirm", "withdraw", "withdraw-correction", "learn", "stop", "select",
     "mode", "trash", "restore", "purge", "connect", "draft"
 };
 

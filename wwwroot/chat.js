@@ -245,10 +245,16 @@ async function openCorrection(sourceSid, id) {
     correctionTarget = {...target, version:saved.version};
     $('correct-question').value = saved.prompt;
     $('correct-answer').value = saved.answer;
-    $('correction-status').textContent = saved.state === 'withdrawn' ?
-      '這個例子已撤回。再次確認才會加入學習佇列。' : '';
+    const state = saved.state === 'withdrawn' && saved.can_withdraw ? 'training-only' : saved.state;
+    $('correction-status').textContent = {
+      'training-only': '已移出訓練佇列，這筆更正仍會用於後續聊天。',
+      withdrawn: '這筆更正已撤回。再次確認後才會生效。',
+      needs_review: '更正來源已有變更，請核對目前內容。'
+    }[state] || '';
     $('correction-review').hidden = $('correction-refresh').hidden = true;
     $('confirm-correction').disabled = false;
+    $('withdraw-correction').hidden = !saved.can_withdraw;
+    $('withdraw-correction').disabled = false;
     $('correction-dialog').showModal();
   } catch (error) {
     if (opening === correctionOpening && sid === sourceSid) showStatus(error.message);
@@ -522,17 +528,16 @@ $('stop').addEventListener('click', stop);
 $('stop-learning').addEventListener('click', stop);
 $('open-sidebar').addEventListener('click', () => $('sidebar').classList.toggle('open'));
 document.querySelectorAll('[data-close]').forEach(button => button.addEventListener('click', () => $(button.dataset.close).close()));
-$('correction-form').addEventListener('submit', async event => {
-  event.preventDefault();
+async function saveCorrection(route, details, notice) {
   const target = correctionTarget;
-  if (!target?.version) return;
-  const button = event.submitter;
-  button.disabled = true;
+  const confirm = $('confirm-correction');
+  const withdraw = $('withdraw-correction');
+  if (!target?.version || confirm.disabled) return;
+  confirm.disabled = withdraw.disabled = true;
   try {
-    await api('confirm', {...target, prompt: $('correct-question').value.trim(),
-      answer: $('correct-answer').value.trim()});
+    await api(route, {...target, ...details});
     if (target === correctionTarget) $('correction-dialog').close();
-    showStatus('確認更正已加入本機學習佇列。');
+    showStatus(notice);
     await load();
   } catch (error) {
     if (target !== correctionTarget) return;
@@ -543,8 +548,16 @@ $('correction-form').addEventListener('submit', async event => {
     }
     $('correction-status').textContent = error.message;
   } finally {
-    if (target === correctionTarget) button.disabled = !target.version;
+    if (target === correctionTarget) confirm.disabled = withdraw.disabled = !target.version;
   }
+}
+$('correction-form').addEventListener('submit', event => {
+  event.preventDefault();
+  saveCorrection('confirm', {prompt: $('correct-question').value.trim(), answer: $('correct-answer').value.trim()},
+    '確認更正已加入本機學習佇列。');
+});
+$('withdraw-correction').addEventListener('click', () => {
+  saveCorrection('withdraw-correction', {}, '已從後續聊天及微調撤回這筆更正。');
 });
 $('correction-refresh').addEventListener('click', async () => {
   const target = correctionTarget;
@@ -559,6 +572,8 @@ $('correction-refresh').addEventListener('click', async () => {
     $('correction-status').textContent = '請比較本機版本與目前輸入。按確認才會保存目前輸入。';
     target.version = saved.version;
     $('confirm-correction').disabled = false;
+    $('withdraw-correction').hidden = !saved.can_withdraw;
+    $('withdraw-correction').disabled = false;
   } catch (error) {
     $('correction-status').textContent = error.message;
   } finally {
@@ -583,7 +598,7 @@ async function learningData() {
     if (box.checked) kept++;
     label.prepend(box);
     label.append(element('small', '已確認 · 版本 ' + row.revision));
-    line.append(label, action('撤回', async () => {
+    line.append(label, action('移出訓練佇列', async () => {
       try { await api('withdraw', {id: row.id, revision: row.revision}); await learningData(); }
       catch (error) { $('learning-status').textContent = error.message; }
     }, 'withdraw'));
