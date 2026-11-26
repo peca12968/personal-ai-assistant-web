@@ -18,3 +18,4 @@ dialog{width:min(600px,calc(100% - 25px));max-height:88dvh;overflow:auto;backgro
 .composer .stage-time{font-size:.8rem;font-variant-numeric:tabular-nums}
 .message-source summary{cursor:pointer}.source-detail{margin:0 0 7px;color:var(--muted);font-size:.78rem;white-space:pre-wrap;overflow-wrap:anywhere}
 #correction-dialog .dialog-actions{flex-wrap:wrap}
+.candidate-actions{display:flex;flex-wrap:wrap;gap:6px;justify-content:flex-end}.evaluation-case{border-top:1px solid var(--line);padding:10px 0;overflow-wrap:anywhere}.evaluation-case summary{cursor:pointer}.evaluation-case h3{font-size:.86rem;margin:10px 0 4px}.evaluation-case p{white-space:pre-wrap;margin:0 0 6px}.evaluation-case small{color:var(--muted)}

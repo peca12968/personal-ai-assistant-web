@@ -11,6 +11,7 @@ let retryAttempt = null;
 let correctionTarget = null;
 let correctionOpening = 0;
 let learningRequest = 0;
+let evaluationRequest = 0;
 let viewRevision = 0;
 let viewLoading = false;
 let historyCursor = null;
@@ -619,13 +620,50 @@ async function learningData() {
       phase ? phase + '時中斷' : (stages[row.status] || row.status), row.id.slice(0, 8)];
     line.append(element('span', label.filter(Boolean).join(' · ')));
     if (row.status === 'rejected' && row.error) line.append(element('small', row.error));
+    const buttons = element('div', undefined, 'candidate-actions');
+    buttons.append(action('驗收明細', () => openEvaluation(row.id)));
     if (row.status === 'validated' && row.id !== state.active) {
-      line.append(action('選用', () => selectVersion(row.id)));
+      buttons.append(action('選用', () => selectVersion(row.id)));
     }
+    line.append(buttons);
     return line;
   });
   if (state.active) candidates.unshift(action('改用原始 BF16 底座', () => selectVersion(null)));
   $('candidates').replaceChildren(...candidates);
+}
+function evaluationResult(result) {
+  if (!result) return '尚無紀錄';
+  return (result.matches ? '答對' : '未答對') + (result.model_calls === 0 ? '（未呼叫模型）' : '');
+}
+function evaluationCase(row) {
+  const kind = {holdout: '未見題', control: '舊技能對照', example: '確認更正'}[row.kind];
+  const label = kind + (row.kind === 'example' ? ' · 版本 ' + row.revision : '');
+  const entry = element('details', undefined, 'evaluation-case');
+  entry.append(element('summary', [label, '底座 ' + evaluationResult(row.baseline),
+    '重載後 ' + evaluationResult(row.candidate)].join(' · ')));
+  entry.append(element('h3', '題目'), element('p', row.question), element('h3', '預期答案'), element('p', row.expected));
+  for (const [name, result] of [['底座回覆', row.baseline], ['重載後回覆', row.candidate]]) {
+    entry.append(element('h3', name), element('p', result?.answer ?? '尚無紀錄'));
+    if (result) entry.append(element('small', result.model_calls == null ? '模型呼叫數未記錄' : '模型呼叫 ' + result.model_calls + ' 次'));
+  }
+  return entry;
+}
+async function openEvaluation(id) {
+  const request = ++evaluationRequest;
+  const dialog = $('evaluation-dialog');
+  $('evaluation-title').textContent = '驗收明細 · ' + id.slice(0, 8);
+  $('evaluation-status').textContent = '正在讀取本機紀錄…';
+  $('evaluation-cases').replaceChildren();
+  if (!dialog.open) dialog.showModal();
+  try {
+    const detail = await api('learning?' + new URLSearchParams({job:id}));
+    if (request !== evaluationRequest || !dialog.open) return;
+    if (detail.id !== id) throw new Error('驗收批次不符。');
+    $('evaluation-cases').replaceChildren(...detail.cases.map(evaluationCase));
+    $('evaluation-status').textContent = '';
+  } catch (error) {
+    if (request === evaluationRequest && dialog.open) $('evaluation-status').textContent = error.message;
+  }
 }
 async function selectVersion(id) {
   try {
