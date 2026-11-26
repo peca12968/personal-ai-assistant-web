@@ -185,9 +185,17 @@ function messageNode(row, sourceSid, retry = null) {
   const article = element('article', undefined, 'message ' + row.role);
   const name = row.role === 'user' ? '你' : '助理';
   const label = row.source?.label ? name + ' · ' + row.source.label : name;
-  if (row.source?.detail) {
+  const notes = [row.source?.detail].filter(Boolean);
+  if (row.source?.usage) {
+    const {input_tokens, output_tokens, model_calls} = row.source.usage;
+    const input = input_tokens.toLocaleString('zh-TW');
+    const output = output_tokens.toLocaleString('zh-TW');
+    notes.push(`本輪用量 · 輸入 ${input} tokens · 回覆 ${output} tokens`);
+    if (model_calls > 1) notes.push('模型呼叫 ' + model_calls + ' 次');
+  }
+  if (notes.length) {
     const source = element('details', undefined, 'message-source');
-    source.append(element('summary', label, 'speaker'), element('div', row.source.detail, 'source-detail'));
+    source.append(element('summary', label, 'speaker'), element('div', notes.join('\n'), 'source-detail'));
     article.append(source);
   } else {
     article.append(element('div', label, 'speaker'));
