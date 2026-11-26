@@ -1840,10 +1840,10 @@ index 0000000000000000000000000000000000000000..e4eb5a10dc46324b1b090f690f31e8a7
 +        api.CloseHandle(job)
 diff --git a/assistant/qwen27_engine.py b/assistant/qwen27_engine.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..5d1a1f67b14befd51f116d3263565173e3565e1a
+index 0000000000000000000000000000000000000000..6255f435b5355ddfe93728fec2eda3d641209803
 --- /dev/null
 +++ b/assistant/qwen27_engine.py
-@@ -0,0 +1,321 @@
+@@ -0,0 +1,363 @@
 +"""Loopback-only CUDA llama.cpp inference for verified Qwen3.8-27B GGUF weights."""
 +from contextlib import contextmanager, ExitStack
 +from contextvars import copy_context
@@ -1852,6 +1852,7 @@ index 0000000000000000000000000000000000000000..5d1a1f67b14befd51f116d3263565173
 +import os
 +from pathlib import Path
 +from queue import Empty, Queue
++import re
 +import secrets
 +import socket
 +import subprocess
@@ -1884,6 +1885,9 @@ index 0000000000000000000000000000000000000000..5d1a1f67b14befd51f116d3263565173
 +Q8_SHA256 = 'a830e736efa71ce29589ff20b8713333a427e0d46ab774723be23800ad54362d'
 +Q8_CONTEXT = 16384
 +THINKING = {'reasoning_effort': 'none', 'chat_template_kwargs': {'enable_thinking': False}}
++CONNECTION_PROBES = {'test', 'ping', '測試', '測試一下', '連線測試'}
++_PROBE_CONTEXT = re.compile(r'\b(?:tests?|testing|ping|next (?:reply|message|response)|from now on)\b'
++                            r'|測試|試跑|連線|驗證|下一[則輪句]|接下來|往後', re.IGNORECASE)
 +
 +
 +def generation_settings(max_tokens=REPLY_TOKENS):
@@ -1923,6 +1927,42 @@ index 0000000000000000000000000000000000000000..5d1a1f67b14befd51f116d3263565173
 +        raise EngineError('已停止本機回答。', 'cancelled')
 +    if time.monotonic() >= deadline:
 +        raise EngineError('27B 本機回答逾時。', 'timeout')
++
++
++def connection_probe(prompt):
++    """Recognize a bare UI probe when no available context gives it another meaning."""
++    from .engine import is_iis_chat, render_prompt_parts
++
++    _, boundary, payload = prompt.rpartition(local_chat_budget.DATA_BOUNDARY)
++    if not boundary or '<|' in payload:
++        return None
++    try:
++        context = json.loads(payload)
++        question = context['current_request']
++        if question.strip().casefold() not in CONNECTION_PROBES or not is_iis_chat(context):
++            return None
++        if any(context.get(key) for key in ('session_brief', 'memories', 'earlier_user_excerpts', 'image_inputs', 'task_runs',
++                                           'named_topic', 'decision_sources', '本輪接續', 'retry_of')):
++            return None
++        if (any(context.get('documents', {}).values()) or any(context.get('autonomous_goals', {}).values())
++                or context.get('answer_feedback', {}).get('items')
++                or any(context.get('earlier_user_corrections', {}).values())):
++            return None
++        history = context.get('recent_conversation', ())
++        if history and history[-1]['role'] == 'assistant' and history[-1]['content'].rstrip().endswith(('?', '？')):
++            return None
++        for row in history:
++            if row['role'] != 'user':
++                continue
++            content = row['content']
++            if row.get('truncated') or (content.strip().casefold() not in CONNECTION_PROBES
++                                        and _PROBE_CONTEXT.search(content)):
++                return None
++        if ''.join(render_prompt_parts(context)) == prompt:
++            return question
++    except (KeyError, TypeError, ValueError, AttributeError, RecursionError):
++        pass
++    return None
 +
 +
 +def chat_prompt(prompt):
@@ -2154,9 +2194,11 @@ index 0000000000000000000000000000000000000000..5d1a1f67b14befd51f116d3263565173
 +    def messages(self, prompt, *, description=None):
 +        if not isinstance(prompt, str) or not prompt.strip() or len(prompt.encode('utf-8')) > MAX_PROMPT_BYTES:
 +            raise EngineError('本機提示必須為有效文字，並符合大小上限。', 'invalid_input')
-+        prompt = chat_prompt(prompt)
++        if probe := connection_probe(prompt):
++            return [{'role': 'system', 'content': SYSTEM_GUIDANCE + '\n用一句簡短的話回應使用者的連線測試。'},
++                    {'role': 'user', 'content': probe}]
 +        system = SYSTEM_GUIDANCE + '\n本次本機引擎資訊\n' + json.dumps(description or self.describe(), ensure_ascii=False)
-+        return [{'role': 'system', 'content': system}, {'role': 'user', 'content': prompt}]
++        return [{'role': 'system', 'content': system}, {'role': 'user', 'content': chat_prompt(prompt)}]
 +
 +    def answer(self, prompt, cancel=None):
 +        messages = self.messages(prompt)
@@ -3534,10 +3576,10 @@ index 0000000000000000000000000000000000000000..8549526f87a4b6d9733661156bf49c52
 +    print(verify())
 diff --git a/tests/test_html_chat.py b/tests/test_html_chat.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..c07d591f772407f3e4a63596305d764ffd6bdadb
+index 0000000000000000000000000000000000000000..989d9aa78edbec83bf3717fdfe9f2eb40fd71d90
 --- /dev/null
 +++ b/tests/test_html_chat.py
-@@ -0,0 +1,1415 @@
+@@ -0,0 +1,1442 @@
 +from contextlib import contextmanager, nullcontext
 +import hashlib
 +from io import BytesIO
@@ -4144,6 +4186,33 @@ index 0000000000000000000000000000000000000000..c07d591f772407f3e4a63596305d764f
 +        self.assertIn(f'{limit + 37:,} tokens', str(caught.exception))
 +        self.assertIn(f'{limit:,} tokens', str(caught.exception))
 +        self.assertEqual(calls.call_count, 2)
++
++    def test_27b_bare_connection_probe_keeps_the_selected_model_and_preserves_context_when_referenced(self):
++        engine = object.__new__(Qwen27Engine)
++        engine.batch = engine.adapter = None
++        self.store.add_message(self.sid, 'user', '你有辦法寫程式碼嗎？')
++        self.store.add_message(self.sid, 'assistant', '可以協助撰寫和閱讀程式碼。')
++        self.store.add_message(self.sid, 'user', '那需要費用嗎？')
++        self.store.add_message(self.sid, 'assistant', '本機回覆依硬體與電力運行。')
++
++        def messages(question, sid=self.sid):
++            context = self.app.driver.prepare_context(sid, question)
++            return engine.messages(''.join(render_prompt_parts(context)))
++
++        brief = messages('test')
++        self.assertEqual(brief[1], {'role': 'user', 'content': 'test'})
++        self.assertIn('連線測試', brief[0]['content'])
++        self.assertNotIn('需要費用', json.dumps(brief, ensure_ascii=False))
++        ordinary = messages('那這個模型可以直接幫我測試程式碼嗎？')
++        self.assertIn('那需要費用嗎', ordinary[1]['content'])
++
++        self.store.add_message(self.sid, 'user', '收到我輸入 test 時，請依照上面的例子解釋。')
++        referenced = messages('test')
++        self.assertIn('收到我輸入 test 時', referenced[1]['content'])
++        self.assertGreater(len(referenced[1]['content']), len(brief[1]['content']))
++        other = self.store.new_session()
++        self.store.add_message(other, 'user', '下一則請只回一個英文字。')
++        self.assertIn('下一則請只回一個英文字', messages('test', other)[1]['content'])
 +
 +    def test_27b_load_progress_uses_bound_server_events_and_clears_after_readiness(self):
 +        root = self.store.path.parent
