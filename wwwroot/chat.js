@@ -287,6 +287,7 @@ const stages = {
   waiting: '等候電腦連續閒置 10 分鐘', baseline: '正在量測微調前的回答',
   training: '正在本機微調 LoRA', converting: '正在轉成 GGUF',
   checking: '正在重載並驗收', validated: '候選已通過驗收',
+  needs_chat_validation: '待依目前聊天設定驗收',
   rejected: '候選未通過保留題或控制題', already_correct: '底座已答對保留題',
   stale: '確認更正已變更', done: '已完成', failed: '本次未完成', cancelled: '已停止', interrupted: '已中斷'
 };
