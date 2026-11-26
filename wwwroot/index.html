@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>個人 AI 助理</title>
+  <link rel="stylesheet" href="/chat.css">
+  <script src="/chat.js" defer></script>
+</head>
+<body>
+  <aside class="sidebar" id="sidebar">
+    <div class="brand"><span aria-hidden="true">◆</span> 個人 AI 助理</div>
+    <button class="primary" id="new-chat" type="button">＋ 新對話</button>
+    <nav id="sessions" aria-label="對話紀錄"></nav>
+    <button class="rail-button" id="learning" type="button">本機模型學習</button>
+    <button class="rail-button" id="trash-list" type="button">歷史回收筒</button>
+  </aside>
+  <main>
+    <header>
+      <button class="menu-button" id="open-sidebar" type="button" aria-label="對話清單">☰</button>
+      <div class="conversation"><h1 id="title">新對話</h1><p id="model">Qwen3.8-27B BF16</p></div>
+      <div class="power" aria-label="模型運作模式">
+        <label class="toggle"><input id="chat-power" type="checkbox" role="switch">使用模型</label>
+        <label class="toggle"><input id="training-power" type="checkbox" role="switch">訓練</label>
+      </div>
+      <button id="trash-current" type="button">移到回收筒</button>
+    </header>
+    <section class="history" id="history" aria-label="對話" aria-live="polite"></section>
+    <section class="composer">
+      <p id="status" role="status"></p>
+      <form id="chat-form">
+        <label class="sr-only" for="question">輸入訊息</label>
+        <textarea id="question" rows="3" maxlength="16000" placeholder="輸入訊息…" required></textarea>
+        <div class="compose-actions">
+          <button type="button" id="retry" hidden>重試上輪</button>
+          <span class="shortcut">Ctrl + Enter 送出</span>
+          <button type="button" id="stop" hidden>停止</button>
+          <button class="primary" id="send" type="submit">送出</button>
+        </div>
+      </form>
+    </section>
+  </main>
+  <dialog id="trash-dialog">
+    <div class="dialog-title"><h2>歷史回收筒</h2><button type="button" data-close="trash-dialog" aria-label="關閉">×</button></div>
+    <div id="trash-items"></div>
+    <p id="trash-status" class="dialog-status" role="status"></p>
+  </dialog>
+  <dialog id="correction-dialog">
+    <div class="dialog-title"><h2>確認更正</h2><button type="button" data-close="correction-dialog" aria-label="關閉">×</button></div>
+    <form id="correction-form">
+      <label for="correct-question">可單獨理解的問題</label>
+      <textarea id="correct-question" rows="3" maxlength="2000" required></textarea>
+      <label for="correct-answer">你確認的完整正確答案</label>
+      <textarea id="correct-answer" rows="5" maxlength="2000" required></textarea>
+      <p class="dialog-status" id="correction-status" role="status"></p>
+      <div class="dialog-actions"><button type="button" data-close="correction-dialog">取消</button><button class="primary" type="submit">確認並加入學習佇列</button></div>
+    </form>
+  </dialog>
+  <dialog id="learning-dialog" class="learning-dialog">
+    <div class="dialog-title"><h2>本機模型學習</h2><button type="button" data-close="learning-dialog" aria-label="關閉">×</button></div>
+    <form id="learning-form">
+      <fieldset><legend>已確認的例子</legend><div id="examples"></div></fieldset>
+      <label for="holdout-question">驗收問題（用另一種問法或未見案例）</label>
+      <textarea id="holdout-question" rows="2" maxlength="2000" required></textarea>
+      <label for="holdout-answer">驗收的完整答案</label>
+      <textarea id="holdout-answer" rows="2" maxlength="2000" required></textarea>
+      <p id="learning-status" class="dialog-status" role="status"></p>
+      <div class="dialog-actions"><button type="button" id="stop-learning" hidden>停止學習</button><button class="primary" id="start-learning" type="submit">閒置時微調</button></div>
+    </form>
+    <section id="candidates" aria-label="已驗收版本"></section>
+  </dialog>
+</body>
+</html>

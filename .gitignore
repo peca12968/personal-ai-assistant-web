@@ -1,0 +1,15 @@
+bin/
+obj/
+deploy/
+runtime/
+*.sqlite*
+*.paibackup
+*.safetensors
+*.gguf
+.env
+.env.*
+*.log
+*.key
+*.user
+.vs/
+appsettings.Local.json

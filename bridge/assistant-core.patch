@@ -1,0 +1,1981 @@
+diff --git a/Start.cmd b/Start.cmd
+index 184d57d65750e647e4aaf12bfb7bf4a42e4eda68..1d611f3b33585a1e1b5cd09fc66b196933e95f6b 100644
+--- a/Start.cmd
++++ b/Start.cmd
+@@ -9,7 +9,20 @@ if errorlevel 1 (
+     ".venv\Scripts\python.exe" -m pip install --only-binary=:all: -r requirements.txt
+     if errorlevel 1 goto failed
+ )
++if "%~1"=="" goto html
++if /I "%~1"=="--classic" goto classic
+ ".venv\Scripts\python.exe" -m scripts.daily_chat %*
++goto check
++:classic
++".venv\Scripts\python.exe" -m scripts.daily_chat
++goto check
++:html
++if exist "..\personal-ai-assistant-web\Open-Desktop.ps1" (
++    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "..\personal-ai-assistant-web\Open-Desktop.ps1"
++    goto check
++)
++".venv\Scripts\python.exe" -m assistant.html_chat
++:check
+ if errorlevel 1 goto failed
+ exit /b 0
+ :failed
+diff --git a/assistant/answer_runs.py b/assistant/answer_runs.py
+index 9b36a2da1ccf3b7114c4aed9dd878672792bc36d..da71a1761e58c692656c2c0a4384ab51e0b1c5e8 100644
+--- a/assistant/answer_runs.py
++++ b/assistant/answer_runs.py
+@@ -87,8 +87,10 @@ def retry_target(store, sid):
+ 
+ 
+ def begin(store, sid, run_id, question, context, retry=None, draft=None):
++    from .chat_history import assert_active
+     with store.connect() as db:
+         db.execute('BEGIN IMMEDIATE')
++        assert_active(db, sid)
+         if db.execute("SELECT 1 FROM answer_runs WHERE session_id=? AND status='running'", (sid,)).fetchone():
+             raise ValueError('目前對話已有尚未完成的回答流程，請先等候或停止。')
+         if 'image_inputs' in context:
+diff --git a/assistant/backup.py b/assistant/backup.py
+index c3144cc593526602d4195267d244bc9e9c9d28fd..01da10bf4da6c8cff4196cd9d2355d266739e27e 100644
+--- a/assistant/backup.py
++++ b/assistant/backup.py
+@@ -15,6 +15,7 @@ from . import __version__
+ 
+ MAX_DATABASE_BYTES = 512 * 1024 * 1024
+ TABLES = {
++    'chat_history_state': {'session_id', 'state', 'changed_at'},
+     'learning_examples': {'id','revision','status','prompt','answer','source_json','fingerprint','recorded_at'},
+     'chat_images': {'id','session_id','name','format','width','height','size_bytes','sha256','data','active','created_at'},
+     'chat_drafts': {'session_id','revision','content'},
+@@ -116,7 +117,7 @@ def validate_database(path):
+             raise ValueError('記憶草稿資料表不完整。')
+         if 'memory_replacements' in actual_tables and not memory_tables <= actual_tables:
+             raise ValueError('記憶更新來源資料表不完整。')
+-        if not set(TABLES) - draft_tables - memory_tables - {'answer_deliveries', 'learning_examples', 'chat_images', 'feedback_versions', 'memory_replacements', 'review_reminders', 'memory_aliases'} - {'task_runs', 'memory_sequence', 'local_memory_messages', 'answer_runs', 'autonomous_goals', 'autonomous_steps', 'autonomous_decision_scopes', 'autonomous_handoffs', 'companion_profile', 'goal_reviews', 'autonomous_conversations', 'autonomous_continuous_runs', 'autonomous_conversation_history', 'autonomous_reply_sources', 'autonomous_guidance_sources', 'autonomous_question_withdrawals', 'autonomous_partial_rechecks', 'autonomous_comparison_resumes'} - delivery_tables - delivery_changes - csv_tables - quantity_scope_tables <= actual_tables <= set(TABLES):
++        if not set(TABLES) - draft_tables - memory_tables - {'chat_history_state', 'answer_deliveries', 'learning_examples', 'chat_images', 'feedback_versions', 'memory_replacements', 'review_reminders', 'memory_aliases'} - {'task_runs', 'memory_sequence', 'local_memory_messages', 'answer_runs', 'autonomous_goals', 'autonomous_steps', 'autonomous_decision_scopes', 'autonomous_handoffs', 'companion_profile', 'goal_reviews', 'autonomous_conversations', 'autonomous_continuous_runs', 'autonomous_conversation_history', 'autonomous_reply_sources', 'autonomous_guidance_sources', 'autonomous_question_withdrawals', 'autonomous_partial_rechecks', 'autonomous_comparison_resumes'} - delivery_tables - delivery_changes - csv_tables - quantity_scope_tables <= actual_tables <= set(TABLES):
+             raise ValueError('資料庫格式不相容，請使用建立備份時的相容版本。')
+         for name, columns in TABLES.items():
+             if name not in actual_tables:
+@@ -125,6 +126,9 @@ def validate_database(path):
+                 raise ValueError('資料庫欄位不相容：' + name)
+         if db.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
+             raise ValueError('資料庫完整性檢查未通過。')
++        if 'chat_history_state' in actual_tables:
++            from .chat_history import validate_saved as validate_history
++            validate_history(db)
+         from .image_inputs import validate_saved as validate_images
+         validate_images(db, table_present='chat_images' in actual_tables)
+         if 'feedback_versions' in actual_tables:
+diff --git a/assistant/chat_history.py b/assistant/chat_history.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..db2b786e52eb43790257332b13475e81cd4b0401
+--- /dev/null
++++ b/assistant/chat_history.py
+@@ -0,0 +1,70 @@
++"""SQL history retention for a user-selected conversation."""
++import re
++
++
++def session_id(value):
++    if not isinstance(value, str) or not re.fullmatch('[0-9a-f]{32}', value):
++        raise ValueError('對話編號無效。')
++    return value
++
++
++def assert_active(db, sid):
++    if db.execute('SELECT 1 FROM chat_history_state WHERE session_id=?', (sid,)).fetchone():
++        raise ValueError('此對話已移到回收筒或已永久刪除。')
++
++
++def validate_saved(db):
++    for sid, state, changed_at in db.execute('SELECT session_id,state,changed_at FROM chat_history_state'):
++        session_id(sid)
++        if (state not in ('trash', 'purged') or not isinstance(changed_at, str) or not changed_at
++                or not db.execute('SELECT 1 FROM sessions WHERE id=?', (sid,)).fetchone()
++                or (state == 'purged' and db.execute('SELECT 1 FROM messages WHERE session_id=?', (sid,)).fetchone())):
++            raise ValueError('聊天歷史保存狀態不符。')
++
++
++def trash(store):
++    with store.connect() as db:
++        return [dict(row) for row in db.execute("""SELECT s.id, s.title, h.changed_at
++            FROM chat_history_state h JOIN sessions s ON s.id=h.session_id
++            WHERE h.state='trash' ORDER BY h.changed_at DESC, s.id""")]
++
++
++def change(store, sid, operation):
++    sid = session_id(sid)
++    with store.connect() as db:
++        if operation == 'purge':
++            db.execute('PRAGMA secure_delete = ON')
++        db.execute('BEGIN IMMEDIATE')
++        row = db.execute("""SELECT h.state FROM sessions s
++            LEFT JOIN chat_history_state h ON h.session_id=s.id WHERE s.id=?""", (sid,)).fetchone()
++        if row is None or row['state'] == 'purged':
++            raise ValueError('找不到這段對話。')
++        if db.execute("SELECT 1 FROM answer_runs WHERE session_id=? AND status='running'", (sid,)).fetchone():
++            raise ValueError('這段對話還有回答在進行，請先停止。')
++        if operation == 'trash' and row['state'] is None:
++            db.execute("INSERT INTO chat_history_state(session_id,state) VALUES(?,'trash')", (sid,))
++        elif operation == 'restore' and row['state'] == 'trash':
++            db.execute('DELETE FROM chat_history_state WHERE session_id=?', (sid,))
++        elif operation == 'purge' and row['state'] == 'trash':
++            purge(db, sid)
++        else:
++            raise ValueError('對話狀態已變更，請重新整理。')
++    return {'id': sid, 'operation': operation}
++
++
++def purge(db, sid):
++    # Remove the SQL chat and its owned reply records. Keep the session id for
++    # separately retained workflow, document, memory and learning references.
++    if db.execute('''SELECT 1 FROM autonomous_conversations c JOIN autonomous_goals g ON c.goal_id=g.id
++                     WHERE g.session_id=? LIMIT 1''', (sid,)).fetchone():
++        raise ValueError('有自主工作依賴這段聊天的來源快照，可先保留在回收筒。')
++    matching = 'SELECT id FROM messages WHERE session_id=?'
++    db.execute('DELETE FROM answer_runs WHERE session_id=?', (sid,))
++    db.execute('DELETE FROM chat_draft_submissions WHERE session_id=?', (sid,))
++    db.execute('DELETE FROM chat_drafts WHERE session_id=?', (sid,))
++    for table in ('feedback_versions', 'feedback', 'answer_checks', 'answer_contexts',
++                  'answer_deliveries', 'local_memory_messages'):
++        db.execute(f'DELETE FROM {table} WHERE message_id IN ({matching})', (sid,))
++    db.execute('DELETE FROM messages WHERE session_id=?', (sid,))
++    db.execute("UPDATE sessions SET title='已永久刪除的對話' WHERE id=?", (sid,))
++    db.execute("UPDATE chat_history_state SET state='purged',changed_at=CURRENT_TIMESTAMP WHERE session_id=?", (sid,))
+diff --git a/assistant/html_chat.py b/assistant/html_chat.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f788a27221261469417b29937bbafc555e806a93
+--- /dev/null
++++ b/assistant/html_chat.py
+@@ -0,0 +1,390 @@
++"""F-drive HTML desktop client for the existing local assistant and 27B runner."""
++import argparse
++from contextlib import contextmanager
++from http import HTTPStatus
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++import json
++import os
++from pathlib import Path
++import secrets
++import sqlite3
++import subprocess
++from tempfile import TemporaryDirectory
++from threading import Event, RLock, Thread
++import time
++from urllib.parse import parse_qs, urlsplit
++import uuid
++
++from . import answer_runs, chat_history, learning_batches, learning_queue, qwen27_learning
++from .engine import MAX_QUESTION_CHARS, ROOT
++from .local_models import read_json
++from .owned_process import windows_process
++from .qwen27_engine import Qwen27Engine
++from .store import Store
++from scripts.daily_delivery import DailyLocalEngine
++from scripts.daily_expenses import DailyAssistant
++
++
++STATIC = Path(__file__).parent / 'web_chat'
++FILES = {'/': ('index.html', 'text/html'), '/chat.js': ('chat.js', 'text/javascript'),
++         '/chat.css': ('chat.css', 'text/css')}
++MAX_BODY = 128 * 1024
++
++
++class ChatApp:
++    def __init__(self, store, *, controlled=False):
++        self.store = store
++        self.controlled = controlled
++        self.mode = 'off' if controlled else 'chat'
++        self.switching = False
++        self.guard = RLock()
++        self.cancel = Event()
++        self.worker = None
++        self.job = {}
++        self.choice = store.path.parent / 'local-engine-workspace' / 'qwen27-choice.json'
++        self.warning = ''
++        try:
++            choice = read_json(self.choice) if self.choice.is_file() else {}
++            self.set_engine(choice.get('batch'))
++        except (ValueError, OSError, KeyError, TypeError, sqlite3.Error):
++            self.set_engine(None)
++            self.warning = '已保存的適配器目前無法核對，這個視窗使用 BF16 底座。'
++
++    def set_engine(self, batch):
++        engine = Qwen27Engine(self.store.path.parent, batch=batch)
++        self.engine = engine
++        self.driver = DailyAssistant(self.store, DailyLocalEngine(engine))
++
++    def view(self, sid):
++        rows = self.store.sessions()
++        session = next((row for row in rows if row['id'] == sid), None)
++        if session is None:
++            session = rows[0] if rows else None
++        if session is None:
++            sid = self.store.new_session()
++            rows = self.store.sessions()
++            session = rows[0]
++        sid = session['id']
++        with self.store.connect() as db:
++            recent = self.store.messages(sid, limit=100)
++            messages = []
++            for row in recent:
++                message = {key: row[key] for key in ('id', 'role', 'content')}
++                if row['role'] == 'assistant':
++                    context = self.store.answer_context(row['id']) or {}
++                    question = context.get('current_request')
++                    mode = context.get('response_mode')
++                    if (isinstance(question, str) and not context.get('image_inputs')
++                            and mode not in {'local_memory', 'local_calculation', 'local_document_calculation',
++                                             'local_transcription', 'local_evidence'}):
++                        saved = db.execute('SELECT correction FROM feedback WHERE message_id=? AND rating=-1',
++                                           (row['id'],)).fetchone()
++                        message.update(correctable=True, question=question[:2000],
++                                       correction=saved['correction'] if saved else '')
++                messages.append(message)
++        try:
++            answer_runs.retry_target(self.store, sid)
++            can_retry = True
++        except ValueError:
++            can_retry = False
++        with self.guard:
++            return {'sid': sid, 'title': session['title'], 'model': self.engine.display_name,
++                    'sessions': [{key: row[key] for key in ('id', 'title')} for row in rows],
++                    'messages': messages, 'can_retry': can_retry, 'warning': self.warning, 'mode': self.mode}
++
++    def require_session(self, sid):
++        if not isinstance(sid, str) or not any(row['id'] == sid for row in self.store.sessions()):
++            raise ValueError('請選擇有效的本機對話。')
++
++    def start(self, kind, action, *, job_id=None):
++        with self.guard:
++            if self.job.get('running'):
++                raise ValueError('目前正在處理本機工作。可先按停止，等程序退出再操作。')
++            self.cancel = Event()
++            job = {'id': job_id or uuid.uuid4().hex, 'kind': kind, 'running': True, 'stage': 'queued'}
++            self.job = job
++
++            def progress(stage):
++                with self.guard:
++                    job['stage'] = stage
++
++            def run():
++                stage, error = 'failed', '本機背景工作中斷。'
++                try:
++                    result = action(self.cancel, progress)
++                    stage = result['status'] if kind == 'learning' else 'done'
++                    error = result.get('error') if kind == 'learning' else None
++                except (ValueError, OSError, RuntimeError, KeyError, TypeError, sqlite3.Error) as exc:
++                    stage = 'cancelled' if self.cancel.is_set() else 'failed'
++                    error = str(exc)[:4000]
++                finally:
++                    with self.guard:
++                        job.update(stage=stage, running=False, error=error)
++
++            self.worker = Thread(target=run, daemon=True)
++            try:
++                self.worker.start()
++            except RuntimeError:
++                job.update(stage='failed', running=False, error='無法啟動本機背景工作。')
++                raise
++            return dict(job)
++
++    def confirm(self, body):
++        message_id, sid = body['message_id'], body['sid']
++        prompt = learning_queue.text(body['prompt'], 2000, '可獨立理解的問題')
++        answer = learning_queue.text(body['answer'], 2000, '完整正確答案')
++        if type(message_id) is not int:
++            raise ValueError('回答編號無效。')
++        with self.store.connect() as db:
++            db.execute('BEGIN IMMEDIATE')
++            match = db.execute("SELECT 1 FROM messages WHERE id=? AND session_id=? AND role='assistant'",
++                               (message_id, sid)).fetchone()
++            if match is None:
++                raise ValueError('請選擇目前對話的助理回答。')
++            matching = []
++            for raw in db.execute(learning_queue.LATEST + ' WHERE q.source_json<>\'null\''):
++                entry = learning_queue.decode(raw)
++                if entry['source']['message_id'] == message_id:
++                    matching.append(entry)
++            if len(matching) > 1:
++                raise ValueError('這則回覆有多個學習例子，請先從學習佇列核對。')
++            self.store.rate(message_id, -1, answer, db=db)
++            source = learning_queue.source_from_feedback(self.store, message_id, db=db)
++            options = {'item_id': matching[0]['id'], 'expected_revision': matching[0]['revision']} if matching else {}
++            entry = learning_queue.confirm(self.store, prompt, answer, source=source, db=db, **options)
++            return {'id': entry['id'], 'revision': entry['revision']}
++
++    def learning(self):
++        with self.store.connect() as db:
++            db.execute('BEGIN')
++            rows = db.execute(learning_queue.LATEST + " WHERE q.status='confirmed' ORDER BY q.rowid DESC").fetchall()
++            examples = []
++            for record in rows:
++                item = learning_queue.observed(self.store, db, learning_queue.decode(record))
++                if item['readiness'] == 'ready':
++                    examples.append({key: item[key] for key in ('id', 'prompt', 'revision', 'status')})
++        return {'examples': examples, 'jobs': qwen27_learning.recent_jobs(self.store.path.parent),
++                'active': self.engine.batch}
++
++    def change_mode(self, requested):
++        if not self.controlled or requested not in ('off', 'chat', 'training'):
++            raise ValueError('模式請選擇關閉、使用模型或訓練。')
++        with self.guard:
++            if self.switching:
++                raise ValueError('正在等候本機程序結束。')
++            if requested == self.mode:
++                return {'mode': self.mode}
++            self.switching = True
++            self.mode = 'stopping'
++            self.cancel.set()
++            worker = self.worker
++        try:
++            if worker:
++                worker.join(timeout=25)
++                if worker.is_alive():
++                    raise TimeoutError('尚未能確認模型程序已完全退出。')
++            with self.guard:
++                self.mode = requested
++                return {'mode': self.mode}
++        finally:
++            with self.guard:
++                self.switching = False
++
++    def dispatch(self, route, body):
++        if route == 'mode':
++            return self.change_mode(body['mode'])
++        if route == 'stop':
++            with self.guard:
++                self.cancel.set()
++            return {'stopping': True}
++        if route == 'confirm':
++            return self.confirm(body)
++        if route == 'withdraw':
++            row = learning_queue.withdraw(self.store, body['id'], body['revision'])
++            return {'status': row['status']}
++        with self.guard:
++            if self.switching or self.job.get('running'):
++                raise ValueError('請等本機工作結束後再操作。')
++            if route in ('trash', 'restore', 'purge'):
++                return chat_history.change(self.store, body['sid'], route)
++            if route == 'new':
++                return {'sid': self.store.new_session()}
++            if route == 'select':
++                batch = body['id']
++                candidate = Qwen27Engine(self.store.path.parent, batch=batch)
++                self.choice.parent.mkdir(parents=True, exist_ok=True)
++                learning_batches.save(self.choice, {'batch': batch})
++                self.engine = candidate
++                self.driver = DailyAssistant(self.store, DailyLocalEngine(candidate))
++                self.warning = ''
++                return {'model': candidate.display_name}
++            if route == 'learn':
++                if self.controlled and self.mode != 'training':
++                    raise ValueError('請先打開訓練開關。')
++                job_id = qwen27_learning.prepare(self.store, body['selection'], body['holdout'])
++                return self.start('learning', lambda cancel, progress: qwen27_learning.run(
++                    self.store, job_id, cancel, on_progress=progress), job_id=job_id)
++            if route in ('ask', 'retry'):
++                if self.controlled and self.mode != 'chat':
++                    raise ValueError('請先打開使用模型開關。')
++                sid = body['sid']
++                self.require_session(sid)
++                question = body.get('question')
++                if route == 'ask':
++                    learning_queue.text(question, MAX_QUESTION_CHARS, '問題')
++                driver = self.driver
++
++                def answer(cancel, progress):
++                    progress('answering')
++                    if route == 'ask':
++                        return driver.ask(sid, question, cancel)
++                    return driver.retry(sid, cancel)
++
++                return self.start('chat', answer)
++        raise ValueError('找不到本機操作。')
++
++    def close(self):
++        with self.guard:
++            self.cancel.set()
++            worker = self.worker
++        if worker:
++            worker.join(timeout=30)
++            if worker.is_alive():
++                raise TimeoutError('仍在等待本機程序退出。')
++
++
++class Handler(BaseHTTPRequestHandler):
++    def log_message(self, *args):
++        pass
++
++    def send(self, status, body, kind):
++        self.send_response(status)
++        self.send_header('Content-Type', kind + '; charset=utf-8')
++        self.send_header('Content-Length', str(len(body)))
++        self.send_header('Cache-Control', 'no-store')
++        self.send_header('Referrer-Policy', 'no-referrer')
++        self.send_header('X-Content-Type-Options', 'nosniff')
++        self.send_header('Content-Security-Policy',
++                         "default-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
++        self.end_headers()
++        self.wfile.write(body)
++
++    def json(self, value, status=HTTPStatus.OK):
++        self.send(status, json.dumps(value, ensure_ascii=False).encode('utf-8'), 'application/json')
++
++    def authorized(self):
++        return secrets.compare_digest(self.headers.get('Authorization', ''), 'Bearer ' + self.server.key)
++
++    def do_GET(self):
++        self.handle_route(post=False)
++
++    def do_POST(self):
++        self.handle_route(post=True)
++
++    def handle_route(self, *, post):
++        if self.headers.get('Host') != self.server.authority:
++            return self.json({'error': '此服務只接受桌面視窗的本機位址。'}, HTTPStatus.FORBIDDEN)
++        url = urlsplit(self.path)
++        if not post and url.path in FILES and not url.query:
++            filename, kind = FILES[url.path]
++            return self.send(HTTPStatus.OK, (STATIC / filename).read_bytes(), kind)
++        if not url.path.startswith('/api/') or not self.authorized():
++            return self.json({'error': '請從個人助理的啟動程式開啟視窗。'}, HTTPStatus.UNAUTHORIZED)
++        route = url.path[5:]
++        state = self.server.app
++        try:
++            if post:
++                if self.headers.get('Origin') != self.server.address:
++                    return self.json({'error': '無法核對本機視窗來源。'}, HTTPStatus.FORBIDDEN)
++                if self.headers.get_content_type() != 'application/json':
++                    raise ValueError('操作只接受 JSON。')
++                size = int(self.headers.get('Content-Length', 0))
++                if not 1 <= size <= MAX_BODY:
++                    raise ValueError('本機請求大小不符。')
++                self.connection.settimeout(5)
++                body = json.loads(self.rfile.read(size))
++                if not isinstance(body, dict):
++                    raise ValueError('本機請求必須是 JSON 物件。')
++                return self.json(state.dispatch(route, body))
++            if route == 'view':
++                return self.json(state.view(parse_qs(url.query).get('sid', [None])[0]))
++            if route == 'status':
++                with state.guard:
++                    return self.json({**state.job, 'mode': state.mode})
++            if route == 'trash':
++                return self.json({'sessions': chat_history.trash(state.store)})
++            if route == 'learning':
++                return self.json(state.learning())
++            return self.json({'error': '找不到本機頁面。'}, HTTPStatus.NOT_FOUND)
++        except (ValueError, OSError, RuntimeError, KeyError, TypeError, sqlite3.Error) as exc:
++            return self.json({'error': str(exc)[:4000]}, HTTPStatus.BAD_REQUEST)
++
++
++@contextmanager
++def server_for(app):
++    with ThreadingHTTPServer(('127.0.0.1', 0), Handler) as server:
++        server.app = app
++        server.key = secrets.token_urlsafe(24)
++        server.authority = '127.0.0.1:' + str(server.server_port)
++        server.address = 'http://' + server.authority
++        thread = Thread(target=server.serve_forever, daemon=True)
++        thread.start()
++        try:
++            yield server.address, server.key
++        finally:
++            server.shutdown()
++            thread.join()
++            app.close()
++
++
++def edge_executable():
++    if os.name == 'nt':
++        import winreg
++        key = r'Software\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe'
++        for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
++            for bits in (winreg.KEY_WOW64_32KEY, winreg.KEY_WOW64_64KEY):
++                try:
++                    with winreg.OpenKey(hive, key, access=winreg.KEY_READ | bits) as handle:
++                        path = Path(winreg.QueryValueEx(handle, '')[0].strip('"'))
++                    if path.is_file():
++                        return path
++                except OSError:
++                    continue
++    system = os.environ.get('SystemDrive', 'C:') + '/'
++    homes = (os.environ.get('ProgramFiles(x86)', system + 'Program Files (x86)'),
++             os.environ.get('ProgramFiles', system + 'Program Files'), os.environ.get('LOCALAPPDATA'))
++    for directory in homes:
++        path = Path(directory or '.') / 'Microsoft/Edge/Application/msedge.exe'
++        if directory and path.is_file():
++            return path
++    raise OSError('找不到 Microsoft Edge，本機 HTML 視窗無法開啟。')
++
++
++def run_window(store):
++    app = ChatApp(store)
++    workspace = store.path.parent / 'local-engine-workspace'
++    workspace.mkdir(parents=True, exist_ok=True)
++    edge = edge_executable()
++    with server_for(app) as (address, key):
++        # The Edge profile is unique to this session. Its job owns browser children.
++        with TemporaryDirectory(prefix='html-profile-', dir=workspace, ignore_cleanup_errors=True) as profile:
++            command = [str(edge), '--app=' + address + '/#key=' + key, '--user-data-dir=' + profile,
++                       '--no-first-run', '--no-default-browser-check', '--disable-background-mode',
++                       '--disable-extensions']
++            with windows_process(command, hidden=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as process:
++                while process.poll() is None:
++                    time.sleep(0.2)
++
++
++def main():
++    parser = argparse.ArgumentParser(description='啟動本機 HTML 聊天視窗')
++    parser.add_argument('--data-dir', type=Path, default=ROOT / 'data')
++    args = parser.parse_args()
++    try:
++        run_window(Store(args.data_dir / 'assistant.sqlite3'))
++    except (ValueError, OSError, RuntimeError, sqlite3.Error) as exc:
++        parser.exit(1, '本機助理無法開啟視窗。' + str(exc) + '\n')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/assistant/iis_bridge.py b/assistant/iis_bridge.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..646349946f4e39360caa703b0a166eaed3c8ccb5
+--- /dev/null
++++ b/assistant/iis_bridge.py
+@@ -0,0 +1,41 @@
++"""Interactive Windows bridge for the IIS front end, with compute off on startup."""
++import argparse
++from pathlib import Path
++import os
++import time
++
++from .engine import ROOT
++from .html_chat import ChatApp, server_for
++from .learning_batches import save
++from .local_models import read_json
++from .store import Store
++from scripts.learning.runtime import gpu_lease
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument('--runtime', type=Path, required=True)
++    parser.add_argument('--data-dir', type=Path, default=ROOT / 'data')
++    args = parser.parse_args()
++    runtime = args.runtime.resolve()
++    runtime.mkdir(parents=True, exist_ok=True)
++    descriptor = runtime / 'bridge.json'
++    with gpu_lease(runtime / 'bridge.lock'):
++        # Normal IIS activation runs in a service session. This bridge is started
++        # from the interactive desktop so native Windows idle and CUDA see it.
++        store = Store(args.data_dir / 'assistant.sqlite3')
++        with server_for(ChatApp(store, controlled=True)) as (address, key):
++            value = {'address': address, 'key': key, 'pid': os.getpid()}
++            save(descriptor, value)
++            try:
++                while True:
++                    time.sleep(2)
++            except KeyboardInterrupt:
++                pass
++            finally:
++                if descriptor.is_file() and read_json(descriptor) == value:
++                    descriptor.unlink()
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/assistant/learning_queue.py b/assistant/learning_queue.py
+index d7493f3dc1a97a0185afae16d6019af6c85ac21d..9416c8b185754d47e47a51072d75c1cece0c0756 100644
+--- a/assistant/learning_queue.py
++++ b/assistant/learning_queue.py
+@@ -1,4 +1,5 @@
+ """Explicit local training examples with immutable revisions; no training or model calls."""
++from contextlib import nullcontext
+ import hashlib
+ import json
+ import re
+@@ -159,11 +160,13 @@ def append(db, item_id, revision, status, prompt, answer, source):
+     return latest(db, item_id)
+ 
+ 
+-def confirm(store, prompt, answer, *, source=None, item_id=None, expected_revision=None):
++def confirm(store, prompt, answer, *, source=None, item_id=None, expected_revision=None, db=None):
+     text(prompt, 2000, '學習問題'); text(answer, 2000, '正確答案')
+     source = json.loads(encoded(validate_source(source)))  # Detach caller-owned data.
+-    with store.connect() as db:
+-        db.execute('BEGIN IMMEDIATE')
++    owns_transaction = db is None
++    with (store.connect() if owns_transaction else nullcontext(db)) as db:
++        if owns_transaction:
++            db.execute('BEGIN IMMEDIATE')
+         old = None
+         if item_id is not None:
+             old = latest(db, item_id)
+diff --git a/assistant/memory_commands.py b/assistant/memory_commands.py
+index 6bb14a94aaaf1a04091f0972b6de809299c90d50..d8b721007d313f8cd3c62d9fe8a5fef1fb1f632b 100644
+--- a/assistant/memory_commands.py
++++ b/assistant/memory_commands.py
+@@ -154,6 +154,7 @@ def operate(db, command):
+ 
+ 
+ def handle_command(store, sid, question, command, cancel=None, draft=None):
++    from .chat_history import assert_active
+     def check_cancel():
+         if cancel and cancel.is_set():
+             raise RuntimeError('已停止本次記憶操作，沒有保存變更。')
+@@ -161,6 +162,7 @@ def handle_command(store, sid, question, command, cancel=None, draft=None):
+     # Mutation, receipts and local-only markers commit together, or all roll back.
+     with store.connect() as db:
+         db.execute('BEGIN IMMEDIATE')
++        assert_active(db, sid)
+         uid = db.execute("INSERT INTO messages(session_id,role,content) VALUES(?,'user',?)", (sid, question)).lastrowid
+         from .chat_drafts import consume
+         consume(db, sid, question, draft, uid)
+diff --git a/assistant/owned_process.py b/assistant/owned_process.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c8f9e19f314c3acf41e84ef4379f954fda57d23a
+--- /dev/null
++++ b/assistant/owned_process.py
+@@ -0,0 +1,82 @@
++"""Run a Windows subprocess in a job that closes the complete process tree."""
++from contextlib import contextmanager
++import ctypes as c
++from ctypes import wintypes as w
++import os
++import subprocess
++import time
++
++
++class BasicLimits(c.Structure):
++    _fields_ = [('process_time', c.c_longlong), ('job_time', c.c_longlong), ('flags', w.DWORD),
++                ('min_working', c.c_size_t), ('max_working', c.c_size_t), ('active', w.DWORD),
++                ('affinity', c.c_size_t), ('priority', w.DWORD), ('scheduling', w.DWORD)]
++
++
++class ExtendedLimits(c.Structure):
++    _fields_ = [('basic', BasicLimits), ('io', c.c_ulonglong * 6),
++                ('memory', c.c_size_t * 4)]
++
++
++class Accounting(c.Structure):
++    _fields_ = [('times', c.c_longlong * 4), ('faults', w.DWORD), ('total', w.DWORD),
++                ('active', w.DWORD), ('terminated', w.DWORD)]
++
++
++@contextmanager
++def windows_process(command, *, hidden=True, **options):
++    if os.name != 'nt':
++        raise OSError('此本機程序需要 Windows。')
++    api = c.WinDLL('kernel32', use_last_error=True)
++    signatures = {
++        'CreateJobObjectW': ([c.c_void_p, w.LPCWSTR], w.HANDLE),
++        'SetInformationJobObject': ([w.HANDLE, c.c_int, c.c_void_p, w.DWORD], w.BOOL),
++        'AssignProcessToJobObject': ([w.HANDLE, w.HANDLE], w.BOOL),
++        'QueryInformationJobObject': ([w.HANDLE, c.c_int, c.c_void_p, w.DWORD, c.c_void_p], w.BOOL),
++        'TerminateJobObject': ([w.HANDLE, w.UINT], w.BOOL),
++        'CloseHandle': ([w.HANDLE], w.BOOL),
++    }
++    for name, (args, result) in signatures.items():
++        function = getattr(api, name)
++        function.argtypes, function.restype = args, result
++    resume = c.WinDLL('ntdll').NtResumeProcess
++    resume.argtypes, resume.restype = [w.HANDLE], w.LONG
++    job = api.CreateJobObjectW(None, None)
++    if not job:
++        raise c.WinError(c.get_last_error())
++    try:
++        limits = ExtendedLimits()
++        limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
++        if not api.SetInformationJobObject(job, 9, c.byref(limits), c.sizeof(limits)):
++            raise c.WinError(c.get_last_error())
++        # Suspend until the job owns even children spawned by a venv redirector.
++        flags = 0x4 | (subprocess.CREATE_NO_WINDOW if hidden else 0)
++        process = subprocess.Popen(command, creationflags=flags, **options)
++        try:
++            handle = int(process._handle)
++            if not api.AssignProcessToJobObject(job, handle):
++                raise c.WinError(c.get_last_error())
++            if resume(handle) != 0:
++                raise OSError('Windows 無法啟動已受控的本機程序。')
++            yield process
++        finally:
++            try:
++                if not api.TerminateJobObject(job, 1):
++                    raise c.WinError(c.get_last_error())
++                if process.poll() is None:
++                    process.kill()  # Also handles an unassigned, suspended process.
++                process.wait(timeout=10)
++                status = Accounting()
++                deadline = time.monotonic() + 10
++                while True:
++                    if not api.QueryInformationJobObject(job, 1, c.byref(status), c.sizeof(status), None):
++                        raise c.WinError(c.get_last_error())
++                    if status.active == 0:
++                        break
++                    if time.monotonic() >= deadline:
++                        raise TimeoutError('無法確認本機程序樹已結束。')
++                    time.sleep(0.03)
++            except ProcessLookupError:
++                process.wait(timeout=10)
++    finally:
++        api.CloseHandle(job)
+diff --git a/assistant/qwen27_engine.py b/assistant/qwen27_engine.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f8de8cdc7ab2cd50130ed4016d2c07ac5307a84b
+--- /dev/null
++++ b/assistant/qwen27_engine.py
+@@ -0,0 +1,230 @@
++"""Loopback-only CUDA llama.cpp inference for the verified Qwen3.8-27B GGUF."""
++from contextlib import contextmanager, ExitStack
++import json
++import os
++from pathlib import Path
++from queue import Empty, Queue
++import secrets
++import socket
++import subprocess
++from tempfile import TemporaryFile
++from threading import Thread
++import time
++from urllib.error import HTTPError, URLError
++from urllib.request import ProxyHandler, Request, build_opener
++
++from .engine import EngineError, MAX_ANSWER_BYTES, MAX_PROMPT_BYTES, ROOT
++from . import local_chat_budget
++from .local_worker import SYSTEM_GUIDANCE
++from .owned_process import windows_process
++from scripts.learning.runtime import gpu_lease
++
++
++ASSETS = ROOT / 'data/learning/experiments/qwen38-bf16-rtx5080'
++MODEL_NAME = 'Qwen3.8-27B-BF16.gguf'
++MODEL_SIZE = 53808282240
++MODEL_SHA256 = 'ee11e8694e5c5cffa0ae21895706c97360350e40532979308b756d20a9a717bd'
++MODEL_REVISION = 'c1869413dece09109e55b7dcc2c77ef382b0d0bd'
++BUILD = 'b12758'
++CONTEXT = 8192
++REPLY_TOKENS = 512
++ALIAS = 'qwen38-27b-bf16'
++THINKING = {'reasoning_effort': 'none', 'chat_template_kwargs': {'enable_thinking': False}}
++
++
++def identity(path):
++    stat = path.stat()
++    return stat.st_size, stat.st_mtime_ns
++
++
++def model_assets():
++    model = ASSETS / 'chat' / MODEL_NAME
++    options = list((ASSETS / 'llama-cuda').rglob('llama-server.exe'))
++    if (len(options) != 1 or not (ASSETS / 'runtime-verified.json').is_file()
++            or not (ASSETS / 'chat-verified.json').is_file() or identity(model)[0] != MODEL_SIZE):
++        raise ValueError('F 槽的 27B BF16 權重或 CUDA 執行檔尚未就緒。')
++    return options[0], model
++
++
++def check_running(cancel, deadline):
++    if cancel is not None and cancel.is_set():
++        raise EngineError('已停止本機回答。', 'cancelled')
++    if time.monotonic() >= deadline:
++        raise EngineError('27B 本機回答逾時。', 'timeout')
++
++
++def chat_prompt(prompt):
++    from .engine import render_prompt_parts
++    from .parameter_acceptance import compact_input
++    from .response_delivery import GUIDANCE, PROMPT_MARKER
++
++    compact = compact_input(prompt)
++    if compact != prompt:
++        return compact
++    _, boundary, payload = prompt.rpartition(local_chat_budget.DATA_BOUNDARY)
++    if not boundary or '<|' in payload:
++        return prompt
++    try:
++        context = json.loads(payload)
++        instructions, data = render_prompt_parts(context)
++        if instructions + data != prompt:
++            return prompt
++    except (KeyError, TypeError, ValueError, AttributeError, RecursionError):
++        return prompt
++    static = (ROOT / 'prompts/system.txt').read_text(encoding='utf-8').replace(PROMPT_MARKER, GUIDANCE)
++    if not instructions.startswith(static):
++        return prompt
++    document_rules = local_chat_budget.DOCUMENT_GUIDANCE if context.get('documents', {}).get('catalog') else ''
++    return (local_chat_budget.GUIDANCE + document_rules + '\n' + GUIDANCE
++            + instructions[len(static):] + data)
++
++
++class LlamaSession:
++    def __init__(self, address, key, process, cancel, deadline):
++        self.address, self.key, self.process = address, key, process
++        self.cancel, self.deadline = cancel, deadline
++
++    def request(self, path, body=None, *, timeout=900):
++        data = json.dumps(body, ensure_ascii=False).encode('utf-8') if body is not None else None
++        call = Request(self.address + path, data=data,
++                       headers={'Authorization': 'Bearer ' + self.key, 'Content-Type': 'application/json'})
++        with build_opener(ProxyHandler({})).open(call, timeout=timeout) as stream:
++            data = stream.read(2 * 1024 * 1024 + 1)
++        if len(data) > 2 * 1024 * 1024:
++            raise ValueError('CUDA 伺服器回覆超出大小上限。')
++        return json.loads(data)
++
++    def query(self, path, body):
++        result = Queue(maxsize=1)
++
++        def request():
++            try:
++                result.put((True, self.request(path, body)))
++            except (OSError, ValueError) as exc:
++                result.put((False, exc))
++
++        Thread(target=request, daemon=True).start()
++        while True:
++            check_running(self.cancel, self.deadline)
++            if self.process.poll() is not None:
++                raise EngineError('27B CUDA 伺服器在回答中結束。', 'local_process_failed')
++            try:
++                success, value = result.get(timeout=0.12)
++            except Empty:
++                continue
++            if not success:
++                raise EngineError('27B 本機推理未完成。', 'local_inference_failed') from value
++            return value
++
++    def answer(self, messages, *, max_tokens=REPLY_TOKENS):
++        body = {'model': ALIAS, 'messages': messages, **THINKING}
++        formatted = self.query('/apply-template', body)['prompt']
++        tokens = self.query('/tokenize', {'content': formatted, 'parse_special': True, 'add_special': True})['tokens']
++        if not 1 <= len(tokens) <= CONTEXT - max_tokens - 4:
++            raise EngineError(f'27B 的 {CONTEXT} token 上下文容納不了完整輸入與回答，請縮短本輪內容。', 'local_input_too_large')
++        output = self.query('/v1/chat/completions', {**body, 'max_tokens': max_tokens,
++                            'temperature': 0, 'seed': 42, 'cache_prompt': False})
++        choice, = output['choices']
++        if choice['finish_reason'] == 'length':
++            raise EngineError(f'回答達到 {max_tokens} token 上限，請指定較短的輸出。', 'local_generation_limit')
++        answer = choice['message']['content']
++        usage = output['usage']
++        if (choice['finish_reason'] != 'stop' or not isinstance(answer, str) or not answer.strip()
++                or len(answer.encode('utf-8')) > MAX_ANSWER_BYTES or usage['prompt_tokens'] >= CONTEXT - max_tokens):
++            raise EngineError('27B 回覆內容或長度無法核對。', 'invalid_response')
++        return answer.strip()
++
++
++class Qwen27Engine:
++    def __init__(self, data_dir, *, batch=None, timeout=650):
++        self.data_dir = Path(data_dir).resolve()
++        self.workdir = self.data_dir / 'local-engine-workspace'
++        self.timeout = timeout
++        try:
++            self.executable, self.model = model_assets()
++            self.identities = {item: identity(item) for item in (self.executable, self.model)}
++        except (ValueError, OSError) as exc:
++            raise EngineError('F 槽的 27B BF16 權重或 CUDA 執行檔尚未就緒。', 'local_environment') from exc
++        self.batch = batch
++        self.adapter = None if batch is None else self._candidate()
++        label = ' · LoRA' if batch else ''
++        self.display_name = 'Qwen3.8-27B BF16' + label
++
++    def _candidate(self):
++        from .qwen27_learning import verified_candidate
++        return verified_candidate(self.data_dir, self.batch)
++
++    def describe(self):
++        return {'runs_on_this_computer': True, 'engine': 'llama.cpp CUDA', 'llama_build': BUILD,
++                'model': 'Qwen3.8-27B', 'precision': 'BF16', 'revision': MODEL_REVISION,
++                'context_tokens': CONTEXT, 'confirmed_batch': self.batch is not None,
++                'adapter_batch': self.batch, 'adapter_sha256': self.adapter[1] if self.adapter else None}
++
++    def verify(self):
++        if any(identity(path) != earlier for path, earlier in self.identities.items()):
++            raise EngineError('F 槽權重或 CUDA 執行檔已變更，請重新啟動助理核對。', 'local_model_changed')
++        if self.batch is not None and self._candidate() != self.adapter:
++            raise EngineError('27B 候選版本或確認更正已變更。', 'local_model_changed')
++
++    @contextmanager
++    def session(self, cancel=None, *, test_adapter=None):
++        deadline = time.monotonic() + self.timeout
++        check_running(cancel, deadline)
++        self.verify()
++        with ExitStack() as stack:
++            try:
++                stack.enter_context(gpu_lease())
++            except RuntimeError:
++                raise EngineError('GPU 正在聊天或微調。請等目前工作結束再送出。', 'local_gpu_busy') from None
++            self.workdir.mkdir(parents=True, exist_ok=True)
++            cache = ASSETS / 'cuda-cache'
++            cache.mkdir(exist_ok=True)
++            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
++                listener.bind(('127.0.0.1', 0))
++                port = listener.getsockname()[1]
++            key = secrets.token_urlsafe(24)
++            command = [str(self.executable), '--model', str(self.model), '--alias', ALIAS, '--host', '127.0.0.1',
++                '--port', str(port), '--api-key', key, '--device', 'CUDA0', '--ctx-size', str(CONTEXT),
++                '--parallel', '1', '--threads', '8', '--batch-size', '256', '--ubatch-size', '128',
++                '--n-gpu-layers', 'auto', '--fit-target', '1536', '--jinja', '--no-ui', '--no-context-shift']
++            adapter = test_adapter or (self.adapter[0] if self.adapter else None)
++            if adapter:
++                command += ['--lora', str(adapter)]
++            log = stack.enter_context(TemporaryFile(dir=self.workdir))
++            try:
++                process = stack.enter_context(windows_process(command, cwd=self.executable.parent,
++                    env={**os.environ, 'CUDA_CACHE_PATH': str(cache)}, stdin=subprocess.DEVNULL, stdout=log, stderr=log))
++                server = LlamaSession(f'http://127.0.0.1:{port}', key, process, cancel, deadline)
++                while True:
++                    check_running(cancel, deadline)
++                    if process.poll() is not None:
++                        # Runtime startup diagnostics do not include any submitted messages.
++                        log.seek(max(0, log.seek(0, os.SEEK_END) - 3000))
++                        detail = log.read(3000).decode('utf-8', 'replace')
++                        raise EngineError('27B CUDA 伺服器載入失敗。\n' + detail, 'local_start_failed')
++                    try:
++                        if server.request('/health', timeout=1).get('status') == 'ok':
++                            break
++                    except (HTTPError, URLError, TimeoutError):
++                        pass
++                    time.sleep(0.15)
++                yield server
++                check_running(cancel, deadline)
++                self.verify()
++            except (OSError, subprocess.TimeoutExpired) as exc:
++                raise EngineError('27B 本機程序啟動或結束核對失敗。', 'local_io') from exc
++
++    def messages(self, prompt, *, description=None):
++        if not isinstance(prompt, str) or not prompt.strip() or len(prompt.encode('utf-8')) > MAX_PROMPT_BYTES:
++            raise EngineError('本機提示必須為有效文字，並符合大小上限。', 'invalid_input')
++        prompt = chat_prompt(prompt)
++        system = SYSTEM_GUIDANCE + '\n本次本機引擎資訊\n' + json.dumps(description or self.describe(), ensure_ascii=False)
++        return [{'role': 'system', 'content': system}, {'role': 'user', 'content': prompt}]
++
++    def answer(self, prompt, cancel=None):
++        messages = self.messages(prompt)
++        with self.session(cancel) as server:
++            try:
++                return server.answer(messages)
++            except (KeyError, ValueError, TypeError) as exc:
++                raise EngineError('27B 本機回覆格式無法核對。', 'invalid_response') from exc
+diff --git a/assistant/qwen27_learning.py b/assistant/qwen27_learning.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c5f0376e3c807f61bd4e4bae875295cbeef522c2
+--- /dev/null
++++ b/assistant/qwen27_learning.py
+@@ -0,0 +1,313 @@
++"""Prepare and run one idle-only 27B LoRA batch using current local confirmations."""
++from contextlib import ExitStack
++import hashlib
++import os
++from pathlib import Path
++import sqlite3
++import subprocess
++import time
++import unicodedata
++import uuid
++
++from . import idle_learning, learning_batches as batches, learning_queue as queue
++from .engine import EngineError, ROOT
++from .local_models import read_json
++from .owned_process import windows_process
++from .qwen27_engine import ASSETS, MODEL_SHA256, Qwen27Engine, identity, model_assets
++from .store import Store
++from scripts.learning.runtime import gpu_lease
++
++
++TRAIN_REVISION = '37561816e66b5b9153b1b64c10968c18c1e6f4a0'
++CONVERTER_SHA256 = '9d278b02b1a7a848372f893015c078d150b5c0590859310c1a133440e772ff95'
++CONTROLS = (
++    {'prompt': '只回答一個繁體中文字。英文 cat 的中文是什麼？', 'answer': '貓'},
++    {'prompt': '請只回答數字。17 加 26 等於多少？', 'answer': '43'},
++)
++IDLE_SECONDS = 600
++WAIT_SECONDS = 3600
++WORK_SECONDS = 1800
++
++
++def file_hash(path):
++    with path.open('rb') as stream:
++        return hashlib.file_digest(stream, 'sha256').hexdigest()
++
++
++def training_assets():
++    python = ASSETS / 'train-env/Scripts/python.exe'
++    converter = ASSETS / 'converter/llama.cpp-b12758/convert_lora_to_gguf.py'
++    receipt = read_json(ASSETS / 'train-verified.json')
++    manifest = read_json(ASSETS / 'train-sources.json')
++    if (not python.is_file() or file_hash(converter) != CONVERTER_SHA256 or manifest['revision'] != TRAIN_REVISION
++            or set(receipt['files']) != {row['rfilename'] for row in manifest['files']}):
++        raise ValueError('27B 訓練環境或原始 BF16 權重尚未核對。')
++    files = {}
++    for row in manifest['files']:
++        name = row['rfilename']
++        path = ASSETS / 'train' / name
++        observed = identity(path)
++        if Path(name).name != name or observed[0] != row['size']:
++            raise ValueError('27B BF16 權重分片與驗證清單不符。')
++        files[name] = list(observed)
++    return python, converter, files
++
++
++def job_path(data_dir, job_id):
++    return Path(data_dir).resolve() / 'learning-batches' / '_qwen27_jobs' / batches.identifier(job_id)
++
++
++def normalize_prompt(value):
++    return ''.join(unicodedata.normalize('NFKC', value).split())
++
++
++def read_job(path):
++    manifest = read_json(path / 'manifest.json', 1024 * 1024)
++    receipt = read_json(path / 'receipt.json', 1024 * 1024)
++    if (manifest.get('id') != path.name or manifest.get('schema') != 'qwen27_idle_lora_v1'
++            or manifest.get('base_sha256') != MODEL_SHA256
++            or receipt.get('manifest_sha256') != queue.digest(manifest)):
++        raise ValueError('27B 學習批次與保存規約不符。')
++    return manifest, receipt
++
++
++def prepare(store, selection, holdout):
++    if not isinstance(selection, list) or not 1 <= len(selection) <= 8:
++        raise ValueError('每批請選取 1 至 8 個確認例子。')
++    if not isinstance(holdout, dict) or set(holdout) != {'prompt', 'answer'}:
++        raise ValueError('請提供一題獨立驗收問答。')
++    queue.text(holdout['prompt'], 2000, '驗收問題')
++    queue.text(holdout['answer'], 2000, '驗收答案')
++    seen = {normalize_prompt(row['prompt']) for row in (*CONTROLS, holdout)}
++    if len(seen) != len(CONTROLS) + 1:
++        raise ValueError('驗收問題需與控制題不同。')
++    rows = []
++    ids = set()
++    with store.connect() as db:
++        db.execute('BEGIN')
++        for choice in selection:
++            if not isinstance(choice, dict) or set(choice) != {'id', 'revision'} or type(choice['revision']) is not int:
++                raise ValueError('確認例子選擇格式錯誤。')
++            row = queue.latest(db, choice['id'])
++            key = normalize_prompt(row['prompt'])
++            if (row['id'] in ids or row['revision'] != choice['revision'] or row['status'] != 'confirmed'
++                    or key in seen or not queue.source_current(store, db, row['source'])):
++                raise ValueError('只能使用仍有效的已確認例子，且訓練題與驗收題需不同。')
++            rows.append(row)
++            ids.add(row['id'])
++            seen.add(key)
++    model_assets()
++    _, _, weights = training_assets()
++    job_id = uuid.uuid4().hex
++    path = job_path(store.path.parent, job_id)
++    path.mkdir(parents=True)
++    manifest = {'schema': 'qwen27_idle_lora_v1', 'id': job_id, 'base_sha256': MODEL_SHA256,
++                'train_revision': TRAIN_REVISION, 'weights': weights, 'items': rows,
++                'suite': [holdout, *CONTROLS], 'created': time.time()}
++    batches.save(path / 'manifest.json', manifest)
++    receipt = {'status': 'prepared', 'manifest_sha256': queue.digest(manifest)}
++    batches.save(path / 'receipt.json', receipt)
++    return job_id
++
++
++class IdleGate:
++    def __init__(self, store, manifest, cancel, sensor, idle_seconds, wait_seconds, work_seconds):
++        self.store, self.manifest, self.cancel, self.sensor = store, manifest, cancel, sensor
++        self.idle_seconds, self.work_seconds = idle_seconds, work_seconds
++        self.deadline = time.monotonic() + wait_seconds
++        self.admitted = None
++        self.next_poll = 0
++        self.reason = None
++
++    def check(self):
++        if self.cancel is not None and self.cancel.is_set():
++            raise batches.Stopped('已停止本機學習。')
++        if time.monotonic() >= self.deadline:
++            raise batches.Stopped('已達閒置等待或本機工作的時間上限。')
++        batches.examples_current(self.store, self.manifest)
++        sample = idle_learning.validate_sample(self.sensor())
++        if self.admitted and (sample['last_input_tick'] != self.admitted['last_input_tick']
++                or sample['idle_ms'] < self.idle_seconds * 1000 or sample['ticks_ms'] < self.admitted['ticks_ms']):
++            raise batches.Stopped('偵測到鍵盤或滑鼠恢復使用，已停止學習。')
++        return sample
++
++    def is_set(self):
++        if time.monotonic() >= self.next_poll or (self.cancel and self.cancel.is_set()):
++            self.next_poll = time.monotonic() + 0.5
++            try:
++                self.check()
++            except (ValueError, OSError, RuntimeError, sqlite3.Error) as exc:
++                self.reason = exc
++        return self.reason is not None
++
++    def wait(self):
++        while True:
++            sample = self.check()
++            if sample['idle_ms'] >= self.idle_seconds * 1000:
++                try:
++                    with gpu_lease():
++                        self.admitted = sample
++                except RuntimeError:
++                    pass
++            if self.admitted is not None:
++                self.deadline = time.monotonic() + self.work_seconds
++                self.check()
++                return
++            time.sleep(0.5)
++
++
++def process_job(path, phase, command, gate, *, gpu=False):
++    gate.check()
++    with ExitStack() as stack:
++        if gpu:
++            stack.enter_context(gpu_lease())
++        log = stack.enter_context((path / (phase + '.log')).open('wb'))
++        environment = {**os.environ, 'HF_HUB_OFFLINE': '1', 'TRANSFORMERS_OFFLINE': '1',
++                       'HF_HUB_DISABLE_PROGRESS_BARS': '1', 'PYTHONUTF8': '1'}
++        process = stack.enter_context(windows_process([str(part) for part in command], cwd=ROOT, env=environment,
++                         stdin=subprocess.DEVNULL, stdout=log, stderr=log))
++        while process.poll() is None:
++            if gate.is_set():
++                raise gate.reason
++            time.sleep(0.12)
++        if process.returncode:
++            raise ValueError(f'{phase} 程序結束碼 {process.returncode}。詳細紀錄存於本機 {phase}.log。')
++    gate.check()
++
++
++def score(store, path, suite, gate, *, adapter=None):
++    from scripts.daily_delivery import DailyLocalEngine
++    from scripts.daily_expenses import DailyAssistant
++
++    phase = 'candidate' if adapter else 'baseline'
++    isolated = Store(path / phase / 'assistant.sqlite3')
++    raw = Qwen27Engine(store.path.parent, timeout=650)
++    answers = []
++    try:
++        with raw.session(gate, test_adapter=adapter) as server:
++            class CheckedEngine:
++                display_name = raw.display_name
++
++                def describe(self):
++                    values = raw.describe()
++                    if adapter:
++                        values.update(confirmed_batch=True, adapter_batch=path.name, adapter_sha256=file_hash(adapter))
++                    return values
++
++                def answer(self, prompt, cancel=None):
++                    messages = raw.messages(prompt, description=self.describe())
++                    return server.answer(messages, max_tokens=192)
++
++            driver = DailyAssistant(isolated, DailyLocalEngine(CheckedEngine()))
++            for case in suite:
++                reply = driver.ask(isolated.new_session(), case['prompt'], gate)
++                answers.append(reply['content'].strip())
++    except EngineError:
++        if gate.reason:
++            raise gate.reason
++        raise
++    gate.check()
++    return answers
++
++
++def assessment(suite, baseline, updated):
++    if len(suite) != len(baseline) or len(suite) != len(updated) or len(suite) != 3:
++        raise ValueError('27B 驗收結果數量不符。')
++    expected = [case['answer'].strip() for case in suite]
++    return {'baseline': [value == answer for value, answer in zip(baseline, expected, strict=True)],
++            'candidate': [value == answer for value, answer in zip(updated, expected, strict=True)]}
++
++
++def passes(result):
++    return result['baseline'] == [False, True, True] and result['candidate'] == [True, True, True]
++
++
++def run(store, job_id, cancel=None, *, on_progress=None, sensor=idle_learning.idle_sample,
++        idle_seconds=IDLE_SECONDS, wait_seconds=WAIT_SECONDS, work_seconds=WORK_SECONDS):
++    path = job_path(store.path.parent, job_id)
++    with batches.owner(path):
++        manifest, receipt = read_job(path)
++        if receipt['status'] != 'prepared':
++            raise ValueError('這個閒置批次已開始過，請建立新批次。')
++        gate = IdleGate(store, manifest, cancel, sensor, idle_seconds, wait_seconds, work_seconds)
++
++        def stage(status):
++            receipt['status'] = status
++            batches.save(path / 'receipt.json', receipt)
++            if on_progress:
++                on_progress(status)
++
++        receipt.update(started=time.time(), automatic_activation=False)
++        try:
++            stage('waiting')
++            gate.wait()
++            python, converter, weights = training_assets()
++            if weights != manifest['weights']:
++                raise batches.Stale('訓練權重自準備後已有變更。')
++            stage('baseline')
++            suite = manifest['suite']
++            baseline = score(store, path, suite, gate)
++            receipt['baseline'] = baseline
++            if baseline[0] == suite[0]['answer'].strip():
++                stage('already_correct')
++            else:
++                stage('training')
++                process_job(path, 'fit', [python, '-I', ROOT / 'scripts/learning/qwen27_worker.py', path], gate, gpu=True)
++                fit = read_json(path / 'fit.json')
++                if fit['initial'] == fit['weights'] or len(fit['steps']) < 2:
++                    raise ValueError('LoRA 權重更新無法核對。')
++                stage('converting')
++                adapter = path / 'adapter.gguf'
++                process_job(path, 'convert', [python, '-E', '-s', converter, '--base', ASSETS / 'train', '--outfile',
++                           adapter, '--outtype', 'f32', path / 'adapter'], gate)
++                if not adapter.is_file():
++                    raise ValueError('未產出可重載的 GGUF 適配器。')
++                receipt['adapter_sha256'] = file_hash(adapter)
++                receipt['trained_weights_sha256'] = fit['weights']
++                stage('checking')
++                updated = score(store, path, suite, gate, adapter=adapter)
++                if file_hash(adapter) != receipt['adapter_sha256']:
++                    raise batches.Stale('GGUF 適配器於驗收期間變更。')
++                result = assessment(suite, baseline, updated)
++                receipt.update(candidate=updated, assessment=result)
++                gate.check()
++                stage('validated' if passes(result) else 'rejected')
++        except batches.Stale as exc:
++            receipt['error'] = str(exc)
++            stage('stale')
++        except batches.Stopped as exc:
++            receipt['error'] = str(exc)
++            stage('cancelled')
++        except (OSError, ValueError, RuntimeError, KeyError, TypeError, sqlite3.Error) as exc:
++            receipt['error'] = str(exc)
++            stage('failed')
++        finally:
++            receipt['ended'] = time.time()
++            batches.save(path / 'receipt.json', receipt)
++        return receipt
++
++
++def verified_candidate(data_dir, job_id):
++    path = job_path(data_dir, job_id)
++    manifest, receipt = read_job(path)
++    adapter = path / 'adapter.gguf'
++    if (receipt['status'] != 'validated' or not passes(assessment(manifest['suite'], receipt['baseline'], receipt['candidate']))
++            or file_hash(adapter) != receipt['adapter_sha256']):
++        raise ValueError('只可選用已通過完整驗收的 27B 適配器。')
++    batches.examples_current(Store(Path(data_dir) / 'assistant.sqlite3'), manifest)
++    return adapter, receipt['adapter_sha256']
++
++
++def recent_jobs(data_dir):
++    parent = Path(data_dir) / 'learning-batches' / '_qwen27_jobs'
++    if not parent.is_dir():
++        return []
++    rows = []
++    for path in sorted(parent.iterdir(), key=lambda candidate: candidate.stat().st_mtime, reverse=True)[:12]:
++        try:
++            _, receipt = read_job(path)
++            ui_row = {key: receipt.get(key) for key in ('status', 'assessment', 'error')}
++            rows.append({'id': path.name, **ui_row})
++        except (ValueError, OSError, KeyError, TypeError):
++            continue
++    return rows
+diff --git a/assistant/store.py b/assistant/store.py
+index 6fd9bc5975fc8b9b18c61959a5d04a55a9b81c6a..81d825c7b75b1e758b66ac41ffdc7c8dd6ead9db 100644
+--- a/assistant/store.py
++++ b/assistant/store.py
+@@ -4,13 +4,14 @@ import json
+ import sqlite3
+ import unicodedata
+ import uuid
+-from contextlib import contextmanager
++from contextlib import contextmanager, nullcontext
+ from datetime import date, datetime, timezone
+ from pathlib import Path
+ 
+ from .retrieval import rank_memories, terms
+ from .context import MAX_EARLIER_CORRECTIONS, is_explicit_correction, is_formal_field_decision
+ from .documents import MAX_DOCUMENTS, MAX_SESSION_BYTES, read_document
++from .chat_history import assert_active
+ 
+ 
+ def validate_memory(content, kind, expires_on):
+@@ -49,6 +50,10 @@ class Store:
+                 CREATE TABLE IF NOT EXISTS sessions (
+                     id TEXT PRIMARY KEY, title TEXT NOT NULL,
+                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
++                CREATE TABLE IF NOT EXISTS chat_history_state (
++                    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
++                    state TEXT NOT NULL CHECK(state IN ('trash','purged')),
++                    changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                 CREATE TABLE IF NOT EXISTS messages (
+                     id INTEGER PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
+                     role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+@@ -323,10 +328,14 @@ class Store:
+ 
+     def sessions(self):
+         with self.connect() as db:
+-            return [dict(r) for r in db.execute("SELECT * FROM sessions ORDER BY rowid DESC")]
++            return [dict(r) for r in db.execute("""SELECT s.* FROM sessions s
++                WHERE NOT EXISTS (SELECT 1 FROM chat_history_state h WHERE h.session_id=s.id)
++                ORDER BY s.rowid DESC""")]
+ 
+     def add_message(self, sid, role, content):
+         with self.connect() as db:
++            db.execute('BEGIN IMMEDIATE')
++            assert_active(db, sid)
+             cur = db.execute("INSERT INTO messages(session_id, role, content) VALUES (?, ?, ?)",
+                              (sid, role, content))
+             if role == "user":
+@@ -395,6 +404,8 @@ class Store:
+ 
+     def add_answer(self, sid, answer, context, checks=None):
+         with self.connect() as db:
++            db.execute('BEGIN IMMEDIATE')
++            assert_active(db, sid)
+             mid = db.execute("INSERT INTO messages(session_id, role, content) VALUES (?, 'assistant', ?)",
+                              (sid, answer)).lastrowid
+             db.execute("INSERT INTO answer_contexts(message_id, payload) VALUES (?, ?)",
+@@ -528,11 +539,13 @@ class Store:
+                     'groups': [group for i, group in enumerate(aliases['groups']) if '@user_alias:' + str(i) in shared]}
+         return selected
+ 
+-    def rate(self, message_id, rating, correction=""):
++    def rate(self, message_id, rating, correction="", *, db=None):
+         if rating not in (-1, 1):
+             raise ValueError("評分只能是 -1 或 1。")
+-        with self.connect() as db:
+-            db.execute('BEGIN IMMEDIATE')
++        owns_transaction = db is None
++        with (self.connect() if owns_transaction else nullcontext(db)) as db:
++            if owns_transaction:
++                db.execute('BEGIN IMMEDIATE')
+             row = db.execute("SELECT role FROM messages WHERE id=?", (message_id,)).fetchone()
+             if row is None or row["role"] != "assistant":
+                 raise ValueError("只能評價助理回答。")
+diff --git a/assistant/web_chat/chat.css b/assistant/web_chat/chat.css
+new file mode 100644
+index 0000000000000000000000000000000000000000..bd89649389daa9abc55774e6b29af8c1f1829b49
+--- /dev/null
++++ b/assistant/web_chat/chat.css
+@@ -0,0 +1,8 @@
++:root{color-scheme:dark;--bg:#121719;--rail:#0c1113;--panel:#1b2426;--line:#303d3d;--text:#eef2ef;--muted:#9caaa6;--accent:#8be1be;--ink:#082419;font:15px/1.55 "Microsoft JhengHei UI","Segoe UI",sans-serif}
++*{box-sizing:border-box}body{margin:0;display:grid;grid-template-columns:238px minmax(0,1fr);height:100dvh;color:var(--text);background:var(--bg);overflow:hidden}button,textarea{font:inherit}button{cursor:pointer;color:inherit;background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:8px 13px}button:hover{border-color:var(--muted)}button:focus-visible,textarea:focus-visible{outline:2px solid var(--accent);outline-offset:2px}button:disabled{opacity:.48;cursor:default}button[hidden]{display:none}.primary{background:var(--accent);color:var(--ink);border-color:var(--accent);font-weight:700}.primary:hover{background:#adf0d4;border-color:#adf0d4}
++.sidebar{padding:20px 14px;background:var(--rail);border-right:1px solid var(--line);display:flex;flex-direction:column;gap:13px;min-height:0}.brand{font-size:17px;font-weight:750;padding:3px 4px 13px;white-space:nowrap}.brand span{color:var(--accent);margin-right:7px}.sidebar nav{overflow:auto;display:flex;flex-direction:column;gap:4px;flex:1}.session{border:0;text-align:left;white-space:nowrap;text-overflow:ellipsis;overflow:hidden;color:var(--muted);background:transparent}.session:hover,.session[aria-current=true]{background:var(--panel);color:var(--text)}.rail-button{text-align:left}.menu-button{display:none}
++main{display:grid;grid-template-rows:auto minmax(0,1fr) auto;min-width:0;min-height:0}header{padding:16px 24px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:14px;justify-content:space-between}.conversation{flex:1;min-width:0}h1,h2{margin:0;color:var(--text);font-size:1.1rem}h1{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}header p{margin:2px 0 0;color:var(--muted);font-size:.82rem}.local{display:flex;align-items:center;gap:7px;color:var(--muted);white-space:nowrap}.local span{height:7px;width:7px;border-radius:50%;background:var(--accent)}
++.history{overflow:auto;min-height:0;padding:24px max(22px,calc((100% - 820px)/2));scrollbar-gutter:stable}.history:empty:before{content:"輸入一則訊息開始對話。";display:block;padding:50px 0;text-align:center;color:var(--muted)}.message{margin:0 0 23px;max-width:90%;overflow-wrap:anywhere}.message.user{margin-left:auto;background:#244038;border:1px solid #37574b;border-radius:15px 15px 4px 15px;padding:11px 14px}.message.assistant{margin-right:auto;max-width:100%}.speaker{color:var(--muted);font-size:.8rem;margin:0 0 4px}.message p{margin:0;white-space:pre-wrap}.message button{font-size:.8rem;margin-top:8px;padding:3px 8px;color:var(--muted);background:transparent}
++.composer{padding:2px max(22px,calc((100% - 820px)/2)) 20px}.composer>p{min-height:1.5em;margin:0 0 4px;color:var(--muted);font-size:.86rem}.composer form{border:1px solid var(--line);border-radius:15px;background:var(--panel);padding:10px}textarea{background:#151d1f;padding:9px;color:var(--text);border:1px solid var(--line);border-radius:8px;resize:vertical;width:100%}.composer textarea{background:transparent;border:0;resize:none;max-height:26vh}.compose-actions,.dialog-actions{display:flex;justify-content:flex-end;align-items:center;gap:8px}.shortcut{color:var(--muted);font-size:.8rem;margin-right:auto}
++dialog{width:min(600px,calc(100% - 25px));max-height:88dvh;overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px;color:var(--text)}dialog::backdrop{background:#0009}.dialog-title{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}.dialog-title button{font-size:1.25rem;line-height:1;padding:5px 9px}.dialog-title h2{font-size:1.2rem}dialog label{display:block;margin:9px 0 4px}.dialog-status{font-size:.88rem;color:var(--accent);min-height:1.4em}fieldset{border:1px solid var(--line);border-radius:8px;margin:0 0 8px;min-width:0}#examples{max-height:180px;overflow:auto}.example{display:flex;align-items:flex-start;gap:7px;border-bottom:1px solid var(--line);padding:4px 0}.example label{margin:0;flex:1;overflow-wrap:anywhere}.example small{color:var(--muted);display:block}.example .withdraw{font-size:.78rem;padding:3px 5px}.candidate{display:flex;align-items:center;justify-content:space-between;gap:6px;padding:6px 0;border-top:1px solid var(--line);overflow-wrap:anywhere}.candidate button{flex-shrink:0}.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
++@media(max-width:720px){body{grid-template-columns:1fr}.sidebar{display:none;position:fixed;inset:0 auto 0 0;width:min(260px,75%);z-index:2;box-shadow:12px 0 30px #0008}.sidebar.open{display:flex}.menu-button{display:inline-flex}.history{padding-inline:14px}.composer{padding-inline:14px}header{padding-inline:14px}}
+diff --git a/assistant/web_chat/chat.js b/assistant/web_chat/chat.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..32ce83978f4e1583ad42d7c6848d626f64836c2b
+--- /dev/null
++++ b/assistant/web_chat/chat.js
+@@ -0,0 +1,232 @@
++'use strict';
++const $ = id => document.getElementById(id);
++const fragment = new URLSearchParams(location.hash.slice(1));
++const token = fragment.get('key') || sessionStorage.getItem('chatKey');
++if (fragment.has('key')) {
++  sessionStorage.setItem('chatKey', token);
++  history.replaceState(null, '', location.pathname);
++}
++let sid = null;
++let correctionId = null;
++let job = null;
++let lastJob = null;
++let pending = false;
++
++async function api(route, data) {
++  const headers = {Authorization: 'Bearer ' + token};
++  const options = {headers};
++  if (data !== undefined) {
++    headers['Content-Type'] = 'application/json';
++    Object.assign(options, {method: 'POST', body: JSON.stringify(data)});
++  }
++  const response = await fetch('/api/' + route, options);
++  const payload = await response.json();
++  if (!response.ok) throw new Error(payload.error || '本機助理未完成這次操作。');
++  return payload;
++}
++function element(tag, text, css) {
++  const node = document.createElement(tag);
++  if (text !== undefined) node.textContent = text;
++  if (css) node.className = css;
++  return node;
++}
++function action(text, fn, css) {
++  const button = element('button', text, css);
++  button.type = 'button';
++  button.addEventListener('click', fn);
++  return button;
++}
++function showStatus(text) { $('status').textContent = text; }
++function busyState() {
++  const inProgress = pending || Boolean(job && job.running);
++  $('send').disabled = $('retry').disabled = $('new-chat').disabled = inProgress;
++  $('stop').hidden = !inProgress;
++  $('stop-learning').hidden = !(job?.running && job.kind === 'learning');
++  $('start-learning').disabled = inProgress;
++}
++function showMessage(row) {
++  const article = element('article', undefined, 'message ' + row.role);
++  article.append(element('div', row.role === 'user' ? '你' : '助理', 'speaker'));
++  article.append(element('p', row.content));
++  if (row.correctable) {
++    article.append(action('更正這則回答', () => {
++      correctionId = row.id;
++      $('correct-question').value = row.question;
++      $('correct-answer').value = row.correction || '';
++      $('correction-status').textContent = '';
++      $('correction-dialog').showModal();
++    }));
++  }
++  $('history').append(article);
++}
++async function load() {
++  const state = await api('view' + (sid ? '?sid=' + encodeURIComponent(sid) : ''));
++  sid = state.sid;
++  $('model').textContent = state.model;
++  if (state.warning) showStatus(state.warning);
++  $('title').textContent = state.title;
++  $('sessions').replaceChildren(...state.sessions.map(row => {
++    const button = action(row.title, async () => {
++      sid = row.id;
++      $('sidebar').classList.remove('open');
++      await load().catch(error => showStatus(error.message));
++    }, 'session');
++    button.setAttribute('aria-current', String(row.id === sid));
++    button.title = row.title;
++    return button;
++  }));
++  $('history').replaceChildren();
++  state.messages.forEach(showMessage);
++  $('history').scrollTop = $('history').scrollHeight;
++  $('retry').hidden = !state.can_retry;
++}
++const stages = {
++  queued: '等待本機程序', answering: '本機模型正在回答',
++  waiting: '等候電腦連續閒置 10 分鐘', baseline: '正在量測微調前的回答',
++  training: '正在本機微調 LoRA', converting: '正在轉成 GGUF',
++  checking: '正在重載並驗收', validated: '候選已通過驗收',
++  rejected: '候選未通過保留題或控制題', already_correct: '底座已答對保留題',
++  stale: '確認更正已變更', done: '已完成', failed: '本次未完成', cancelled: '已停止'
++};
++async function poll() {
++  try {
++    job = await api('status');
++    const state = job.stage ? stages[job.stage] || job.stage : '';
++    if (job.id && (job.running || lastJob !== job.id)) {
++      const notice = [state, job.error].filter(Boolean).join(' · ');
++      showStatus(notice);
++      if (job.kind === 'learning') $('learning-status').textContent = notice;
++      if (!job.running) {
++        lastJob = job.id;
++        await load();
++        if ($('learning-dialog').open) await learningData();
++      }
++    }
++    busyState();
++  } catch (error) {
++    showStatus(error.message);
++  } finally {
++    setTimeout(poll, 900);
++  }
++}
++async function start(route, data) {
++  pending = true;
++  busyState();
++  try {
++    job = await api(route, data);
++    showStatus(stages[job.stage] || '');
++    return true;
++  } catch (error) {
++    showStatus(error.message);
++    return false;
++  } finally {
++    pending = false;
++    busyState();
++  }
++}
++$('chat-form').addEventListener('submit', async event => {
++  event.preventDefault();
++  const question = $('question').value.trim();
++  if (!question || pending || job?.running) return;
++  if (await start('ask', {sid, question})) {
++    $('question').value = '';
++    showMessage({role: 'user', content: question});
++    $('history').scrollTop = $('history').scrollHeight;
++  }
++});
++$('question').addEventListener('keydown', event => {
++  if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.isComposing) {
++    event.preventDefault();
++    $('chat-form').requestSubmit();
++  }
++});
++$('retry').addEventListener('click', () => start('retry', {sid}));
++$('new-chat').addEventListener('click', async () => {
++  try {
++    sid = (await api('new', {})).sid;
++    $('sidebar').classList.remove('open');
++    await load();
++    $('question').focus();
++  } catch (error) { showStatus(error.message); }
++});
++async function stop() {
++  try { await api('stop', {}); showStatus('正在等待本機程序結束'); }
++  catch (error) { showStatus(error.message); }
++}
++$('stop').addEventListener('click', stop);
++$('stop-learning').addEventListener('click', stop);
++$('open-sidebar').addEventListener('click', () => $('sidebar').classList.toggle('open'));
++document.querySelectorAll('[data-close]').forEach(button => button.addEventListener('click', () => $(button.dataset.close).close()));
++$('correction-form').addEventListener('submit', async event => {
++  event.preventDefault();
++  const button = event.submitter;
++  button.disabled = true;
++  try {
++    await api('confirm', {sid, message_id: correctionId, prompt: $('correct-question').value.trim(),
++      answer: $('correct-answer').value.trim()});
++    $('correction-dialog').close();
++    showStatus('確認更正已加入本機學習佇列。');
++    await load();
++  } catch (error) {
++    $('correction-status').textContent = error.message;
++  } finally {
++    button.disabled = false;
++  }
++});
++async function learningData() {
++  const state = await api('learning');
++  const selected = new Set([...$('examples').querySelectorAll(':checked')].map(node => node.value));
++  const examples = state.examples.map(row => {
++    const line = element('div', undefined, 'example');
++    const label = element('label', row.prompt);
++    const box = element('input');
++    box.type = 'checkbox';
++    box.value = row.id;
++    box.dataset.revision = row.revision;
++    box.checked = selected.has(row.id);
++    label.prepend(box);
++    label.append(element('small', '已確認 · 版本 ' + row.revision));
++    line.append(label, action('撤回', async () => {
++      try { await api('withdraw', {id: row.id, revision: row.revision}); await learningData(); }
++      catch (error) { $('learning-status').textContent = error.message; }
++    }, 'withdraw'));
++    return line;
++  });
++  $('examples').replaceChildren(...(examples.length ? examples : [element('p', '可在聊天回答下方確認更正。')]));
++  const candidates = state.jobs.map(row => {
++    const line = element('div', undefined, 'candidate');
++    line.append(element('span', (stages[row.status] || row.status) + ' · ' + row.id.slice(0, 8)));
++    if (row.status === 'validated' && row.id !== state.active) {
++      line.append(action('選用', () => selectVersion(row.id)));
++    }
++    return line;
++  });
++  if (state.active) candidates.unshift(action('改用原始 BF16 底座', () => selectVersion(null)));
++  $('candidates').replaceChildren(...candidates);
++}
++async function selectVersion(id) {
++  try {
++    await api('select', {id});
++    await load();
++    await learningData();
++    $('learning-status').textContent = '已儲存模型選擇。';
++  } catch (error) { $('learning-status').textContent = error.message; }
++}
++$('learning').addEventListener('click', async () => {
++  $('learning-dialog').showModal();
++  try { await learningData(); }
++  catch (error) { $('learning-status').textContent = error.message; }
++});
++$('learning-form').addEventListener('submit', async event => {
++  event.preventDefault();
++  const selection = [...$('examples').querySelectorAll(':checked')]
++    .map(node => ({id: node.value, revision: Number(node.dataset.revision)}));
++  try {
++    job = await api('learn', {selection, holdout: {prompt: $('holdout-question').value.trim(),
++      answer: $('holdout-answer').value.trim()}});
++    $('learning-status').textContent = stages[job.stage] || '';
++    busyState();
++  } catch (error) { $('learning-status').textContent = error.message; }
++});
++load().catch(error => showStatus(error.message));
++poll();
+diff --git a/assistant/web_chat/index.html b/assistant/web_chat/index.html
+new file mode 100644
+index 0000000000000000000000000000000000000000..aac0da49bc35682ea1d1b4323fd95baf65e89fc2
+--- /dev/null
++++ b/assistant/web_chat/index.html
+@@ -0,0 +1,63 @@
++<!doctype html>
++<html lang="zh-Hant">
++<head>
++  <meta charset="utf-8">
++  <meta name="viewport" content="width=device-width,initial-scale=1">
++  <title>個人 AI 助理</title>
++  <link rel="stylesheet" href="/chat.css">
++  <script src="/chat.js" defer></script>
++</head>
++<body>
++  <aside class="sidebar" id="sidebar">
++    <div class="brand"><span aria-hidden="true">◆</span> 個人 AI 助理</div>
++    <button class="primary" id="new-chat" type="button">＋ 新對話</button>
++    <nav id="sessions" aria-label="對話紀錄"></nav>
++    <button class="rail-button" id="learning" type="button">本機模型學習</button>
++  </aside>
++  <main>
++    <header>
++      <button class="menu-button" id="open-sidebar" type="button" aria-label="對話清單">☰</button>
++      <div class="conversation"><h1 id="title">新對話</h1><p id="model">Qwen3.8-27B BF16</p></div>
++      <div class="local"><span></span>本機</div>
++    </header>
++    <section class="history" id="history" aria-label="對話" aria-live="polite"></section>
++    <section class="composer">
++      <p id="status" role="status"></p>
++      <form id="chat-form">
++        <label class="sr-only" for="question">輸入訊息</label>
++        <textarea id="question" rows="3" maxlength="16000" placeholder="輸入訊息…" required></textarea>
++        <div class="compose-actions">
++          <button type="button" id="retry" hidden>重試上輪</button>
++          <span class="shortcut">Ctrl + Enter 送出</span>
++          <button type="button" id="stop" hidden>停止</button>
++          <button class="primary" id="send" type="submit">送出</button>
++        </div>
++      </form>
++    </section>
++  </main>
++  <dialog id="correction-dialog">
++    <div class="dialog-title"><h2>確認更正</h2><button type="button" data-close="correction-dialog" aria-label="關閉">×</button></div>
++    <form id="correction-form">
++      <label for="correct-question">可單獨理解的問題</label>
++      <textarea id="correct-question" rows="3" maxlength="2000" required></textarea>
++      <label for="correct-answer">你確認的完整正確答案</label>
++      <textarea id="correct-answer" rows="5" maxlength="2000" required></textarea>
++      <p class="dialog-status" id="correction-status" role="status"></p>
++      <div class="dialog-actions"><button type="button" data-close="correction-dialog">取消</button><button class="primary" type="submit">確認並加入學習佇列</button></div>
++    </form>
++  </dialog>
++  <dialog id="learning-dialog" class="learning-dialog">
++    <div class="dialog-title"><h2>本機模型學習</h2><button type="button" data-close="learning-dialog" aria-label="關閉">×</button></div>
++    <form id="learning-form">
++      <fieldset><legend>已確認的例子</legend><div id="examples"></div></fieldset>
++      <label for="holdout-question">驗收問題（用另一種問法或未見案例）</label>
++      <textarea id="holdout-question" rows="2" maxlength="2000" required></textarea>
++      <label for="holdout-answer">驗收的完整答案</label>
++      <textarea id="holdout-answer" rows="2" maxlength="2000" required></textarea>
++      <p id="learning-status" class="dialog-status" role="status"></p>
++      <div class="dialog-actions"><button type="button" id="stop-learning" hidden>停止學習</button><button class="primary" id="start-learning" type="submit">閒置時微調</button></div>
++    </form>
++    <section id="candidates" aria-label="已驗收版本"></section>
++  </dialog>
++</body>
++</html>
+diff --git a/scripts/daily_chat.py b/scripts/daily_chat.py
+index c82591b7eac406d9b7874878892260091f1ac3d7..e9f8cf5c101e004cf68a34084cc42bb2a92aa8d3 100644
+--- a/scripts/daily_chat.py
++++ b/scripts/daily_chat.py
+@@ -254,7 +254,7 @@ def main():
+         if stream is not None and hasattr(stream, 'reconfigure'):
+             stream.reconfigure(encoding='utf-8')
+     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+-    parser.add_argument('--engine', choices=('local', 'codex'))
++    parser.add_argument('--engine', choices=('local', 'codex', 'qwen27'))
+     parser.add_argument('--qualified-segment', action='store_true')
+     choices = parser.add_mutually_exclusive_group()
+     choices.add_argument('--qualified-base-assay')
+@@ -269,6 +269,8 @@ def main():
+     mode.add_argument('--retry-answer', action='store_true')
+     args, other = parser.parse_known_args()
+ 
++    if args.engine == 'qwen27' and (args.local_experiment or args.local_batch or args.local_active or other):
++        parser.error('27B 與原 4B 模型選項需分開選用。')
+     use_codex = False
+     if args.qualified_base_assay is not None:
+         if args.engine or args.qualified_segment or other:
+@@ -303,6 +305,9 @@ def main():
+             elif args.qualified_segment:
+                 from scripts.learning.segment_chat import SegmentEngine
+                 raw = SegmentEngine(args.data_dir)
++            elif args.engine == 'qwen27':
++                from assistant.qwen27_engine import Qwen27Engine
++                raw = Qwen27Engine(args.data_dir)
+             else:
+                 raw = LocalEngine(args.data_dir, experiment=args.local_experiment, batch=args.local_batch,
+                                   active=args.local_active, recover_chat_budget=True)
+diff --git a/scripts/learning/qwen27_worker.py b/scripts/learning/qwen27_worker.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..06356d6ac0cc1d88407546e4a9061ae1dba77c1b
+--- /dev/null
++++ b/scripts/learning/qwen27_worker.py
+@@ -0,0 +1,138 @@
++"""Offline BF16 training for the last four Qwen3.8-27B text layers."""
++import argparse
++import hashlib
++import os
++from pathlib import Path
++import sys
++
++if __package__ in (None, ''):
++    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
++
++from assistant.learning_batches import save
++from assistant.local_models import read_json
++from assistant.local_worker import SYSTEM_GUIDANCE
++from assistant.qwen27_engine import ASSETS
++
++os.environ.update(HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1', TOKENIZERS_PARALLELISM='false',
++                  CUDA_CACHE_PATH=str(ASSETS / 'cuda-cache'), HF_HOME=str(ASSETS / 'cache'),
++                  TORCH_HOME=str(ASSETS / 'cache'), TORCHINDUCTOR_CACHE_DIR=str(ASSETS / 'torch-cache'))
++
++import torch
++from peft import LoraConfig, TaskType, get_peft_model
++from torch import nn
++from torch.func import functional_call
++from transformers import AutoTokenizer
++from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
++
++
++TAIL_LAYERS = 4
++SEED = 20261126
++MAX_SEQUENCE = 384
++
++
++class FrozenCPUBlock(nn.Module):
++    def __init__(self, block, device):
++        super().__init__()
++        self.block, self.device = block, device
++        if any(p.requires_grad or p.device.type != 'cpu' for p in block.parameters()):
++            raise ValueError('offload prefix must be frozen on the CPU')
++
++    def forward(self, *args, **kwargs):
++        with torch.no_grad():
++            state = {name: p.to(self.device) for name, p in self.block.named_parameters()}
++            state.update({name: p.to(self.device) for name, p in self.block.named_buffers()})
++            return functional_call(self.block, state, args, kwargs, strict=True)
++
++
++def parameters_digest(parameters):
++    digest = hashlib.sha256()
++    for name, param in sorted(parameters):
++        data = param.detach().cpu().contiguous()
++        digest.update(str((name, data.dtype, data.shape)).encode())
++        digest.update(data.view(torch.uint8).numpy().tobytes())
++    return digest.hexdigest()
++
++
++def example_tokens(tokenizer, row):
++    reserved = set(tokenizer.all_special_ids)
++    prompt = tokenizer.encode(row['prompt'], add_special_tokens=False)
++    answer = tokenizer.encode(row['answer'], add_special_tokens=False)
++    if not answer or not reserved.isdisjoint(prompt + answer):
++        raise ValueError('訓練內容含保留的角色標記或沒有有效答案。')
++    prefix = tokenizer.apply_chat_template([{'role': 'system', 'content': SYSTEM_GUIDANCE},
++        {'role': 'user', 'content': row['prompt']}], tokenize=True, return_dict=False,
++        add_generation_prompt=True, enable_thinking=False)
++    target = answer + [tokenizer.convert_tokens_to_ids('<|im_end|>')]
++    if len(prefix) + len(target) > MAX_SEQUENCE:
++        raise ValueError(f'單個確認問答連同角色格式最多 {MAX_SEQUENCE} token。')
++    return prefix + target, target
++
++
++def fit(folder):
++    manifest = read_json(folder / 'manifest.json', 1024 * 1024)
++    torch.set_num_threads(6)
++    torch.manual_seed(SEED)
++    if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(including_emulation=False):
++        raise RuntimeError('CUDA 裝置不支援原生 BF16。')
++    device = torch.device('cuda:0')
++    torch.cuda.set_per_process_memory_fraction(0.88, device)
++    source = ASSETS / 'train'
++    tokenizer = AutoTokenizer.from_pretrained(source, local_files_only=True, trust_remote_code=False)
++    examples = [example_tokens(tokenizer, row) for row in manifest['items']]
++    save(folder / 'progress.json', {'phase': 'loading', 'step': 0})
++    base = Qwen3_5ForConditionalGeneration.from_pretrained(source, dtype='auto', device_map={'': 'cpu'},
++             local_files_only=True, trust_remote_code=False, use_safetensors=True, attn_implementation='sdpa')
++    base.requires_grad_(False)
++    language = base.model.language_model
++    count = len(language.layers)
++    split = count - TAIL_LAYERS
++    if count != 64 or language.embed_tokens.weight.dtype != torch.bfloat16:
++        raise ValueError('底座不是預期的 64 層 BF16 Qwen3.8-27B。')
++    model = get_peft_model(base, LoraConfig(task_type=TaskType.CAUSAL_LM, r=8, lora_alpha=16, lora_dropout=0,
++        layers_to_transform=list(range(split, count)), layers_pattern='layers',
++        target_modules=['q_proj', 'v_proj', 'gate_proj', 'up_proj', 'down_proj']))
++    for module in (language.embed_tokens, language.rotary_emb, language.norm, base.lm_head):
++        module.to(device)
++    for pos in range(count):
++        if pos < split:
++            language.layers[pos] = FrozenCPUBlock(language.layers[pos], device)
++        else:
++            language.layers[pos].to(device)
++    parameters = [(name, p) for name, p in model.named_parameters() if p.requires_grad]
++    if not parameters or any('lora_' not in name or p.device.type != 'cuda' for name, p in parameters):
++        raise ValueError('適配器的可訓練參數無法核對。')
++    initial = parameters_digest(parameters)
++    trainable = [p for _, p in parameters]
++    optimizer = torch.optim.AdamW(trainable, lr=2e-4, weight_decay=0)
++    model.train()
++    steps = []
++    epochs = max(2, (8 + len(examples) - 1) // len(examples))
++    for step, (ids, target) in enumerate(examples * epochs, 1):
++        inputs = torch.tensor([ids], device=device)
++        labels = torch.tensor(target, device=device)
++        optimizer.zero_grad(set_to_none=True)
++        with torch.autocast('cuda', dtype=torch.bfloat16, cache_enabled=False):
++            output = model(input_ids=inputs, attention_mask=torch.ones_like(inputs), use_cache=False,
++                           logits_to_keep=len(target) + 1).logits[0, :-1]
++            loss = nn.functional.cross_entropy(output.float(), labels)
++        if not torch.isfinite(loss):
++            raise ValueError('訓練損失不為有限值。')
++        loss.backward()
++        gradient = nn.utils.clip_grad_norm_(trainable, 1, error_if_nonfinite=True)
++        if float(gradient) <= 0:
++            raise ValueError('適配器沒有有效梯度。')
++        optimizer.step()
++        steps.append({'loss': float(loss.detach()), 'gradient': float(gradient)})
++        save(folder / 'progress.json', {'phase': 'training', 'step': step, 'total': len(examples) * epochs})
++    final = parameters_digest(parameters)
++    if initial == final:
++        raise ValueError('適配器參數未更新。')
++    model.save_pretrained(folder / 'adapter', safe_serialization=True, save_embedding_layers=False)
++    save(folder / 'fit.json', {'initial': initial, 'weights': final, 'steps': steps,
++                                'cuda_peak_reserved_mib': torch.cuda.max_memory_reserved() / 1024 ** 2})
++
++
++if __name__ == '__main__':
++    parser = argparse.ArgumentParser()
++    parser.add_argument('folder', type=Path)
++    fit(parser.parse_args().folder)
+diff --git a/tests/test_html_chat.py b/tests/test_html_chat.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9c4e0b4b3e05d0e0bd5c51425344c7a234fd5727
+--- /dev/null
++++ b/tests/test_html_chat.py
+@@ -0,0 +1,125 @@
++import json
++from pathlib import Path
++import tempfile
++import unittest
++from unittest.mock import patch
++from urllib.error import HTTPError
++from urllib.request import Request, urlopen
++
++from assistant import chat_history, learning_queue, qwen27_learning
++from assistant.html_chat import ChatApp, server_for
++from assistant.store import Store
++
++
++class FakeQwen:
++    display_name = 'Qwen3.8-27B BF16'
++    batch = None
++
++    def __init__(self, data_dir, **kwargs):
++        pass
++
++    def describe(self):
++        return {'runs_on_this_computer': True, 'model': 'Qwen3.8-27B'}
++
++    def answer(self, prompt, cancel=None):
++        return '甲'
++
++
++class HtmlChatTests(unittest.TestCase):
++    def setUp(self):
++        folder = self.enterContext(tempfile.TemporaryDirectory())
++        self.store = Store(Path(folder) / 'assistant.sqlite3')
++        self.enterContext(patch('assistant.html_chat.Qwen27Engine', FakeQwen))
++        self.app = ChatApp(self.store)
++        self.sid = self.store.new_session()
++
++    def test_correction_and_feedback_rollback_together(self):
++        reply = self.app.driver.ask(self.sid, '請用一個字猜這張測試卡的內容。')
++        answer_id = reply['id']
++        other = self.store.new_session()
++        correction = {'sid': self.sid, 'message_id': answer_id, 'prompt': '測試卡內容？', 'answer': '乙'}
++        with self.assertRaises(ValueError):
++            self.app.confirm({**correction, 'sid': other})
++        first = self.app.confirm(correction)
++        second = self.app.confirm({**correction, 'answer': '丙'})
++        self.assertEqual(first['id'], second['id'])
++        self.assertEqual(second['revision'], 2)
++        conflict = '已有人確認的另一題'
++        learning_queue.confirm(self.store, conflict, '丁')
++        with self.assertRaises(ValueError):
++            self.app.confirm({**correction, 'prompt': conflict, 'answer': '戊'})
++        current = learning_queue.get(self.store, second['id'])
++        self.assertEqual((current['revision'], current['answer'], current['readiness']), (2, '丙', 'ready'))
++        self.assertEqual(current['source']['correction'], '丙')
++
++    def test_api_requires_key_and_matching_origin(self):
++        with server_for(self.app) as (address, token):
++            with self.assertRaises(HTTPError) as private:
++                urlopen(address + '/api/view', timeout=5)
++            self.assertEqual(private.exception.code, 401)
++            req = Request(address + '/api/new', data=b'{}',
++                          headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json',
++                                   'Origin': 'http://localhost:4321'})
++            with self.assertRaises(HTTPError) as error:
++                urlopen(req, timeout=5)
++            self.assertEqual(error.exception.code, 403)
++            self.assertEqual(len(self.store.sessions()), 1)
++            with urlopen(address + '/', timeout=5) as page:
++                self.assertIn(b'chat.js', page.read())
++
++    def test_prepared_source_revision_and_holdout_are_pinned(self):
++        row = learning_queue.confirm(self.store, '問候語用哪個字？', '乙')
++        selection = [{'id': row['id'], 'revision': row['revision']}]
++        with patch.object(qwen27_learning, 'model_assets'), patch.object(
++                qwen27_learning, 'training_assets', return_value=(None, None, {})):
++            with self.assertRaises(ValueError):
++                qwen27_learning.prepare(self.store, selection, {'prompt': '問候語 用 哪個字？', 'answer': '乙'})
++            job_id = qwen27_learning.prepare(self.store, selection, {'prompt': '正式問候時的字？', 'answer': '乙'})
++            learning_queue.withdraw(self.store, row['id'], row['revision'])
++            with self.assertRaises(ValueError):
++                qwen27_learning.prepare(self.store, selection, {'prompt': '正式問候時的字？', 'answer': '乙'})
++            output = qwen27_learning.run(self.store, job_id)
++            self.assertEqual(output['status'], 'stale')
++
++    def test_reloaded_candidate_requires_target_and_control(self):
++        suite = [{'answer': '乙'}, {'answer': '貓'}, {'answer': '43'}]
++        self.assertTrue(qwen27_learning.passes(qwen27_learning.assessment(suite, ['甲', '貓', '43'], ['乙', '貓', '43'])))
++        self.assertFalse(qwen27_learning.passes(qwen27_learning.assessment(suite, ['甲', '貓', '43'], ['乙', '猫', '43'])))
++
++    def test_mode_gates_chat_and_learning_then_restarts_off(self):
++        app = ChatApp(self.store, controlled=True)
++        with self.assertRaisesRegex(ValueError, '使用模型開關'):
++            app.dispatch('ask', {'sid': self.sid, 'question': '測試'})
++        self.assertEqual(app.change_mode('chat'), {'mode': 'chat'})
++        with self.assertRaisesRegex(ValueError, '訓練開關'):
++            app.dispatch('learn', {})
++        self.assertEqual(app.change_mode('training'), {'mode': 'training'})
++        with self.assertRaisesRegex(ValueError, '使用模型開關'):
++            app.dispatch('retry', {'sid': self.sid})
++        self.assertEqual(ChatApp(self.store, controlled=True).mode, 'off')
++        self.assertEqual(app.change_mode('off'), {'mode': 'off'})
++
++    def test_trash_restore_and_sql_purge_preserve_other_session(self):
++        reply = self.app.driver.ask(self.sid, '請用一個字猜這張測試卡的內容。')
++        self.app.confirm({'sid': self.sid, 'message_id': reply['id'], 'prompt': '測試卡內容？', 'answer': '乙'})
++        other = self.store.new_session()
++        self.store.add_message(other, 'user', '保留這一段')
++        chat_history.change(self.store, self.sid, 'trash')
++        self.assertEqual([row['id'] for row in self.store.sessions()], [other])
++        self.assertEqual(chat_history.trash(self.store)[0]['id'], self.sid)
++        self.assertEqual(len(self.store.messages(self.sid)), 2)
++        chat_history.change(self.store, self.sid, 'restore')
++        self.assertEqual(len(self.store.sessions()), 2)
++        chat_history.change(self.store, self.sid, 'trash')
++        chat_history.change(self.store, self.sid, 'purge')
++        self.assertEqual(self.store.messages(self.sid), [])
++        self.assertEqual(self.store.messages(other)[0]['content'], '保留這一段')
++        self.assertEqual(chat_history.trash(self.store), [])
++        with self.store.connect() as db:
++            self.assertEqual(db.execute('PRAGMA foreign_key_check').fetchall(), [])
++        from assistant.backup import validate_database
++        self.assertEqual(validate_database(self.store.path)['chat_history_state'], 1)
++
++
++if __name__ == '__main__':
++    unittest.main()

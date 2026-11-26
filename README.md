@@ -1,0 +1,18 @@
+# 個人 AI 助理的 IIS 網頁
+
+ASP.NET Core .NET 10、本機 IIS、HTML 介面。站台使用 127.0.0.1:18765，模型和 SQLite 保存在 F 槽個人助理專案。
+
+- 開機後首次開啟桌面捷徑時，使用模型和訓練都關閉。
+- 開啟「使用模型」後可聊天。開啟「訓練」後，選確認更正和未見驗收問答，再安排閒置微調。
+- 切換或關閉時會取消目前工作，等模型程序樹退出才進入新模式。聊天和訓練共用 GPU 鎖。
+- 對話保存在既有 SQLite sessions 和 messages。你可把所選對話移到回收筒，還原或永久刪除該對話的主資料庫聊天內容及回答紀錄。匯出檔案、備份、記憶、另存的學習例子與自主工作保有自己的保存範圍。
+- IIS 頁面和桌面橋接負責顯示歷史與控制狀態。兩個開關都關閉時會釋放 Qwen 推理及訓練程序的資源。
+- 有自主工作仍依賴原聊天來源時，這段歷史可留在回收筒。保留或移除由使用者選擇。
+
+在專案根目錄執行 dotnet publish -c Release -o deploy，再以系統管理員執行 Deploy-Iis.ps1。桌面捷徑執行 Open-Desktop.ps1，讓 GPU 作業與 Windows 閒置偵測在登入工作階段執行。[Microsoft Learn 的 IIS 部署說明](https://learn.microsoft.com/en-us/aspnet/core/host-and-deploy/iis/?view=aspnetcore-10.0)
+
+程式保存在 F 槽本機 Git。runtime、deploy、資料庫、對話、模型權重、適配器和桌面連線金鑰都由 Git 忽略。
+
+## 接入現有個人助理
+
+網站維持獨立專案，桌面橋接沿用原助理的 SQLite、確認佇列與模型環境。`bridge/assistant-core.patch` 保存這次接入原助理的程式碼，二進位執行環境和權重沿用 F 槽的已安裝版本。相容基線為原助理提交 `3cd62d0adc2c1b72b5afa4b14fb842658f8b8b0e`。在相容的原助理 checkout 先以 `git apply --check` 驗證這份補丁。有了接入後的版本，即可在同一 Windows 登入工作階段從桌面啟動網站。
