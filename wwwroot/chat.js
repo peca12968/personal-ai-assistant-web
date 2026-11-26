@@ -181,6 +181,15 @@ function busyState() {
   $('stop-learning').hidden = !(job?.running && job.kind === 'learning');
   $('start-learning').disabled = !connected || inProgress || mode !== 'training';
 }
+function timingNotes(timing) {
+  if (!timing) return [];
+  const seconds = milliseconds => milliseconds < 100 ? '少於 0.1 秒' :
+    (milliseconds / 1000).toLocaleString('zh-TW', {maximumFractionDigits: 1}) + ' 秒';
+  return ['本輪耗時 ' + seconds(timing.total_ms), ...timing.stages.map(phase => {
+    const label = (stages[phase.stage] || phase.stage).replace(/^正在/, '');
+    return label + ' · ' + seconds(phase.elapsed_ms);
+  })];
+}
 function messageNode(row, sourceSid, retry = null) {
   const article = element('article', undefined, 'message ' + row.role);
   const name = row.role === 'user' ? '你' : '助理';
@@ -193,6 +202,7 @@ function messageNode(row, sourceSid, retry = null) {
     notes.push(`本輪用量 · 輸入 ${input} tokens · 回覆 ${output} tokens`);
     if (model_calls > 1) notes.push('模型呼叫 ' + model_calls + ' 次');
   }
+  notes.push(...timingNotes(row.source?.timing));
   if (notes.length) {
     const source = element('details', undefined, 'message-source');
     source.append(element('summary', label, 'speaker'), element('div', notes.join('\n'), 'source-detail'));
@@ -204,6 +214,12 @@ function messageNode(row, sourceSid, retry = null) {
   if (retry && row.role === 'user' && row.id === retry.user_message_id) {
     const reason = {cancelled: '回答已停止', interrupted: '回答曾中斷', failed: '回答未完成'}[retry.status];
     article.append(element('small', reason + ' · 可重試', 'message-state'));
+    if (retry.timing) {
+      const timing = element('details', undefined, 'message-source');
+      timing.append(element('summary', '查看本輪耗時', 'speaker'),
+        element('div', [retry.source, ...timingNotes(retry.timing)].filter(Boolean).join('\n'), 'source-detail'));
+      article.append(timing);
+    }
   }
   if (row.correctable) {
     article.append(action('更正這則回答', () => openCorrection(sourceSid, row.id)));

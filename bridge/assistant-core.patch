@@ -24,15 +24,16 @@ index 184d57d65750e647e4aaf12bfb7bf4a42e4eda68..1d611f3b33585a1e1b5cd09fc66b1969
  exit /b 0
  :failed
 diff --git a/assistant/answer_runs.py b/assistant/answer_runs.py
-index 9b36a2da1ccf3b7114c4aed9dd878672792bc36d..b90a6a35912ec9f3933f4de80f98df36146f458e 100644
+index 9b36a2da1ccf3b7114c4aed9dd878672792bc36d..3a147a5c7e202dd6dde5f26c43ce8f415fc78949 100644
 --- a/assistant/answer_runs.py
 +++ b/assistant/answer_runs.py
-@@ -5,6 +5,17 @@ import sqlite3
+@@ -5,6 +5,37 @@ import sqlite3
  from contextlib import contextmanager
  
  
 +ORIGIN_FIELD = 'answer_origin'
 +USAGE_FIELD = 'answer_token_usage'
++TIMING_FIELD = 'answer_timing'
 +
 +
 +def checked_token_usage(value):
@@ -42,10 +43,29 @@ index 9b36a2da1ccf3b7114c4aed9dd878672792bc36d..b90a6a35912ec9f3933f4de80f98df36
 +    return None
 +
 +
++def checked_timing(value):
++    if not isinstance(value, dict) or set(value) != {'total_ms', 'stages'}:
++        return None
++    from scripts.learning.runtime import CHAT_STAGES
++
++    total, stages = value['total_ms'], value['stages']
++    if type(total) is not int or not 0 <= total < 2**53 or not isinstance(stages, list) or not 2 <= len(stages) <= 64:
++        return None
++    known = CHAT_STAGES | {'queued'}
++    for row in stages:
++        if (not isinstance(row, dict) or set(row) != {'stage', 'elapsed_ms'}
++                or not isinstance(row['stage'], str) or row['stage'] not in known
++                or type(row['elapsed_ms']) is not int or not 0 <= row['elapsed_ms'] <= total):
++            return None
++    if stages[0]['stage'] != 'queued' or sum(row['elapsed_ms'] for row in stages) != total:
++        return None
++    return value
++
++
  ERROR_LABELS = {
      'evidence_invalid': '本機條件核對未完成，請用相同命題名稱分別寫明規則、觀察和待判問題。',
      'transcription_invalid': '本機逐字轉錄未完成；來源、格式或輸出核對失敗，沒有保存完成答案。',
-@@ -36,6 +47,10 @@ class LeaseBusy(RuntimeError):
+@@ -36,6 +67,10 @@ class LeaseBusy(RuntimeError):
      pass
  
  
@@ -56,7 +76,7 @@ index 9b36a2da1ccf3b7114c4aed9dd878672792bc36d..b90a6a35912ec9f3933f4de80f98df36
  @contextmanager
  def lease(store, run_id):
      if not isinstance(run_id, str) or not re.fullmatch(r'[0-9a-f]{32}', run_id):
-@@ -74,21 +89,37 @@ def recover(store, sid):
+@@ -74,21 +109,45 @@ def recover(store, sid):
              continue
  
  
@@ -79,7 +99,7 @@ index 9b36a2da1ccf3b7114c4aed9dd878672792bc36d..b90a6a35912ec9f3933f4de80f98df36
 +
 +
 +def retry_snapshot(db, sid):
-+    row = db.execute('''SELECT id,session_id,user_message_id,answer_message_id,status,error_code,started_at,finished_at
++    row = db.execute('''SELECT id,session_id,user_message_id,answer_message_id,status,error_code,started_at,finished_at,context_json
 +                        FROM answer_runs WHERE session_id=? ORDER BY rowid DESC LIMIT 1''', (sid,)).fetchone()
 +    if not row or row['status'] not in {'failed', 'cancelled', 'interrupted'}:
          raise ValueError('目前沒有可重試的最後一題；進行中或已完成的回答不會重送。')
@@ -90,7 +110,15 @@ index 9b36a2da1ccf3b7114c4aed9dd878672792bc36d..b90a6a35912ec9f3933f4de80f98df36
 +    if not message or message['id'] != row['user_message_id'] or message['role'] != 'user':
          raise ValueError('這題之後已有其他對話；請將需要的問題重新送出，不在新對話後補插舊答案。')
 -    return {**row, 'question': messages[0]['content']}
-+    return {**row, 'question': message['content']}
++    target = dict(row)
++    payload = target.pop('context_json')
++    try:
++        context = json.loads(payload)
++    except (ValueError, TypeError, RecursionError):
++        context = None
++    if isinstance(context, dict) and (timing := checked_timing(context.get(TIMING_FIELD))) is not None:
++        target.update(timing=timing, timing_selection=context.get('engine_selection'))
++    return {**target, 'question': message['content']}
  
  
  def begin(store, sid, run_id, question, context, retry=None, draft=None):
@@ -101,16 +129,16 @@ index 9b36a2da1ccf3b7114c4aed9dd878672792bc36d..b90a6a35912ec9f3933f4de80f98df36
          if db.execute("SELECT 1 FROM answer_runs WHERE session_id=? AND status='running'", (sid,)).fetchone():
              raise ValueError('目前對話已有尚未完成的回答流程，請先等候或停止。')
          if 'image_inputs' in context:
-@@ -121,7 +152,7 @@ def begin(store, sid, run_id, question, context, retry=None, draft=None):
+@@ -121,7 +180,7 @@ def begin(store, sid, run_id, question, context, retry=None, draft=None):
      return uid
  
  
 -def finish(store, run_id, answer, context, checks, *, delivery=None):
-+def finish(store, run_id, answer, context, checks, *, delivery=None, origin=None, usage=None):
++def finish(store, run_id, answer, context, checks, *, delivery=None, origin=None, usage=None, timing=None):
      with store.connect() as db:
          db.execute('BEGIN IMMEDIATE')
          row = db.execute("SELECT session_id,user_message_id FROM answer_runs WHERE id=? AND status='running'",
-@@ -141,7 +172,10 @@ def finish(store, run_id, answer, context, checks, *, delivery=None):
+@@ -141,7 +200,12 @@ def finish(store, run_id, answer, context, checks, *, delivery=None):
                  raise ValueError('交付所需的對話已變更，沒有另存答案。')
              check_clarification_history(db, context, row['session_id'], row['user_message_id'])
          mid = db.execute("INSERT INTO messages(session_id,role,content) VALUES(?,'assistant',?)", (row['session_id'], answer)).lastrowid
@@ -118,10 +146,32 @@ index 9b36a2da1ccf3b7114c4aed9dd878672792bc36d..b90a6a35912ec9f3933f4de80f98df36
 +        saved_context = {**context, ORIGIN_FIELD: origin} if origin is not None else context
 +        if origin == 'model' and (metrics := checked_token_usage(usage)) is not None:
 +            saved_context[USAGE_FIELD] = metrics
++        if (timing := checked_timing(timing)) is not None:
++            saved_context = {**saved_context, TIMING_FIELD: timing}
 +        db.execute('INSERT INTO answer_contexts(message_id,payload) VALUES(?,?)', (mid, json.dumps(saved_context, ensure_ascii=False)))
          db.execute('INSERT INTO answer_checks(message_id,payload) VALUES(?,?)', (mid, json.dumps(checks, ensure_ascii=False)))
          if delivery is not None:
              from .response_delivery import save
+@@ -150,11 +214,16 @@ def finish(store, run_id, answer, context, checks, *, delivery=None):
+     return mid
+ 
+ 
+-def fail(store, run_id, code):
++def fail(store, run_id, code, *, timing=None):
+     code = code if code in ERROR_LABELS and code != 'owner_lost' else 'unexpected_error'
++    timing = checked_timing(timing)
++    recorded = json.dumps(timing, ensure_ascii=False) if timing is not None else None
+     with store.connect() as db:
+-        db.execute("UPDATE answer_runs SET status=?,error_code=?,finished_at=CURRENT_TIMESTAMP WHERE id=? AND status='running'",
+-                   ('cancelled' if code == 'cancelled' else 'failed', code, run_id))
++        db.execute('''UPDATE answer_runs SET status=?,error_code=?,finished_at=CURRENT_TIMESTAMP,
++                         context_json=CASE WHEN ? IS NULL OR NOT json_valid(context_json)
++                                           THEN context_json ELSE json_set(context_json, ?, json(?)) END
++                      WHERE id=? AND status='running' ''',
++                   ('cancelled' if code == 'cancelled' else 'failed', code, recorded, '$.' + TIMING_FIELD, recorded, run_id))
+ 
+ 
+ def context_status(store, sid):
 diff --git a/assistant/backup.py b/assistant/backup.py
 index c3144cc593526602d4195267d244bc9e9c9d28fd..01da10bf4da6c8cff4196cd9d2355d266739e27e 100644
 --- a/assistant/backup.py
@@ -258,7 +308,7 @@ index 0000000000000000000000000000000000000000..db2b786e52eb43790257332b13475e81
 +    db.execute("UPDATE sessions SET title='已永久刪除的對話' WHERE id=?", (sid,))
 +    db.execute("UPDATE chat_history_state SET state='purged',changed_at=CURRENT_TIMESTAMP WHERE session_id=?", (sid,))
 diff --git a/assistant/engine.py b/assistant/engine.py
-index 78bfad433d1abe8c476e44d04bc20f8b5c167020..ce9c61e8b2f7f2d1c9d3998bb8b92e583dfe7bfc 100644
+index 78bfad433d1abe8c476e44d04bc20f8b5c167020..a96dfd9638c9157c10c256798bad45e17c862387 100644
 --- a/assistant/engine.py
 +++ b/assistant/engine.py
 @@ -29,6 +29,16 @@ ROOT = Path(__file__).resolve().parents[1]
@@ -284,7 +334,7 @@ index 78bfad433d1abe8c476e44d04bc20f8b5c167020..ce9c61e8b2f7f2d1c9d3998bb8b92e58
  def render_prompt_parts(context):
 -    if work_delivery.HISTORY_KEY in context:
 -        context = {key: value for key, value in context.items() if key != work_delivery.HISTORY_KEY}
-+    private_fields = {work_delivery.HISTORY_KEY, answer_runs.ORIGIN_FIELD, answer_runs.USAGE_FIELD}
++    private_fields = {work_delivery.HISTORY_KEY, answer_runs.ORIGIN_FIELD, answer_runs.USAGE_FIELD, answer_runs.TIMING_FIELD}
 +    if private_fields.intersection(context):
 +        context = {key: value for key, value in context.items() if key not in private_fields}
      isolated = context.get('context_scope') == CURRENT_MESSAGE_ONLY
@@ -371,28 +421,37 @@ index 78bfad433d1abe8c476e44d04bc20f8b5c167020..ce9c61e8b2f7f2d1c9d3998bb8b92e58
                  if cancel and cancel.is_set():
                      raise EngineError('已停止這次回答。', 'cancelled')
                  from .prompt_scope import transcription_focus
-@@ -567,8 +594,13 @@ class Assistant:
+@@ -567,10 +594,21 @@ class Assistant:
                  checks = [] if evidence is not None or literal else check_citations(answer, context['documents']['excerpts'])
                  if any(not check['range_valid'] for check in checks):
                      answer += '\n\n來源檢查：有引用無法對照本次文件片段，請勿將該引用視為已驗證。'
 -                mid = answer_runs.finish(self.store, run_id, answer, context, checks,
 -                                         **({'delivery': delivery} if delivery is not None else {}))
 +                completion = {'origin': origin} if is_iis_chat(context) else {}
-+                if completion and origin == 'model':
-+                    from scripts.learning.runtime import chat_token_usage
-+                    completion['usage'] = chat_token_usage()
++                if completion:
++                    from scripts.learning.runtime import chat_timing, chat_token_usage
++                    completion['timing'] = chat_timing()
++                    if origin == 'model':
++                        completion['usage'] = chat_token_usage()
 +                if delivery is not None:
 +                    completion['delivery'] = delivery
 +                mid = answer_runs.finish(self.store, run_id, answer, context, checks, **completion)
              except Exception as exc:
-                 answer_runs.fail(self.store, run_id, getattr(exc, 'code', 'unexpected_error'))
+-                answer_runs.fail(self.store, run_id, getattr(exc, 'code', 'unexpected_error'))
++                failure = {}
++                if is_iis_chat(context):
++                    from scripts.learning.runtime import chat_timing
++                    failure['timing'] = chat_timing()
++                answer_runs.fail(self.store, run_id, getattr(exc, 'code', 'unexpected_error'), **failure)
                  raise
+         return {"id": mid, "content": answer, "memory_ids": [m["id"] for m in context["memories"]],
+                 "excerpt_ids": [row["message_id"] for row in context["earlier_user_excerpts"]],
 diff --git a/assistant/html_chat.py b/assistant/html_chat.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..aa46356900dce322bc9b8cd90b9fc095b6e50895
+index 0000000000000000000000000000000000000000..2a1a1361b48a7a1f28b273e4d9e2c6a87d5be238
 --- /dev/null
 +++ b/assistant/html_chat.py
-@@ -0,0 +1,607 @@
+@@ -0,0 +1,612 @@
 +"""F-drive HTML desktop client for the existing local assistant and 27B runner."""
 +import argparse
 +from contextlib import contextmanager
@@ -421,7 +480,7 @@ index 0000000000000000000000000000000000000000..aa46356900dce322bc9b8cd90b9fc095
 +from .store import Store
 +from scripts.daily_delivery import WebChatEngine
 +from scripts.daily_expenses import DailyAssistant
-+from scripts.learning.runtime import ModelPowerRequired, WebModelTask
++from scripts.learning.runtime import ModelPowerRequired, WebModelTask, report_chat_stage
 +
 +
 +STATIC = Path(__file__).parent / 'web_chat'
@@ -590,6 +649,8 @@ index 0000000000000000000000000000000000000000..aa46356900dce322bc9b8cd90b9fc095
 +                        usage = answer_runs.checked_token_usage(context.get(answer_runs.USAGE_FIELD))
 +                        if usage is not None:
 +                            message['source']['usage'] = usage
++                    if (timing := answer_runs.checked_timing(context.get(answer_runs.TIMING_FIELD))) is not None:
++                        message['source']['timing'] = timing
 +                    if (question := correction_question(context)) is not None:
 +                        message.update(correctable=True, question=question[:2000], correction=row['correction'] or '')
 +                messages.append(message)
@@ -599,6 +660,9 @@ index 0000000000000000000000000000000000000000..aa46356900dce322bc9b8cd90b9fc095
 +                try:
 +                    target = answer_runs.retry_snapshot(db, sid)
 +                    retry = {key: target[key] for key in ('id', 'user_message_id', 'status')}
++                    if 'timing' in target:
++                        retry.update(timing=target['timing'],
++                                     source=answer_source({'engine_selection': target['timing_selection']})['label'])
 +                except ValueError:
 +                    pass
 +                latest.update(draft=chat_drafts.read(db, sid), retry=retry)
@@ -835,7 +899,7 @@ index 0000000000000000000000000000000000000000..aa46356900dce322bc9b8cd90b9fc095
 +                driver = self.driver
 +
 +                def answer(cancel, progress):
-+                    progress('chat_context')
++                    report_chat_stage('chat_context')
 +                    if route == 'ask':
 +                        return driver.ask(sid, question, cancel, draft=submission)
 +                    return driver.retry(sid, cancel, expected_run_id=expected_run)
@@ -2905,10 +2969,10 @@ index 0000000000000000000000000000000000000000..708b4fc31bc3749e36fd5fbae10da8d7
 +    with web_model_task('training'):
 +        fit(folder)
 diff --git a/scripts/learning/runtime.py b/scripts/learning/runtime.py
-index 7b43f429b175b8c9e62936b7121a9327e18f4acf..b35382f0e820861e6c837f1f4260909ebb1fd7db 100644
+index 7b43f429b175b8c9e62936b7121a9327e18f4acf..2dd19b9f433489d908716f1a6382625496be03d1 100644
 --- a/scripts/learning/runtime.py
 +++ b/scripts/learning/runtime.py
-@@ -1,14 +1,161 @@
+@@ -1,14 +1,187 @@
 -"""Process-held advisory GPU lease; a leftover file never proves a live owner."""
 +"""Web-authorized model tasks and process-held advisory GPU leases."""
 +from contextvars import ContextVar
@@ -2951,6 +3015,8 @@ index 7b43f429b175b8c9e62936b7121a9327e18f4acf..b35382f0e820861e6c837f1f4260909e
 +        self.token_usage = {'input_tokens': 0, 'output_tokens': 0, 'model_calls': 0}
 +        self.lock = RLock()
 +        self.terminators = set()
++        self.phase_starts = [('queued', time.monotonic())]
++        self.stop_requested = None
 +
 +    @contextmanager
 +    def activate(self):
@@ -2964,6 +3030,8 @@ index 7b43f429b175b8c9e62936b7121a9327e18f4acf..b35382f0e820861e6c837f1f4260909e
 +        self.cancel.set()
 +        failure = None
 +        with self.lock:
++            if self.stop_requested is None:
++                self.stop_requested = time.monotonic()
 +            for terminate in self.terminators:
 +                try:
 +                    terminate()
@@ -2979,9 +3047,31 @@ index 7b43f429b175b8c9e62936b7121a9327e18f4acf..b35382f0e820861e6c837f1f4260909e
 +
 +def report_chat_stage(stage):
 +    task = _WEB_TASK.get()
-+    if (task is not None and task.mode == 'chat' and not task.cancel.is_set()
-+            and task.on_progress is not None and stage in CHAT_STAGES):
++    if task is None or task.mode != 'chat' or stage not in CHAT_STAGES:
++        return
++    with task.lock:
++        if task.cancel.is_set() or task.phase_starts[-1][0] == stage:
++            return
++        task.phase_starts.append((stage, time.monotonic()))
++    if task.on_progress is not None:
 +        task.on_progress(stage)
++
++
++def chat_timing():
++    task = _WEB_TASK.get()
++    if task is None or task.mode != 'chat':
++        return None
++    with task.lock:
++        points = list(task.phase_starts)
++        if len(points) < 2:
++            return None
++        ended = task.stop_requested if task.stop_requested is not None else time.monotonic()
++    origin = points[0][1]
++    offsets = [round((stamp - origin) * 1000) for _, stamp in points]
++    total = round((ended - origin) * 1000)
++    durations = [finish - start for start, finish in zip(offsets, offsets[1:] + [total], strict=True)]
++    return {'total_ms': total, 'stages': [{'stage': name, 'elapsed_ms': duration}
++                                        for (name, _), duration in zip(points, durations, strict=True)]}
 +
 +
 +def report_chat_usage(input_tokens, output_tokens):
@@ -3074,10 +3164,10 @@ index 7b43f429b175b8c9e62936b7121a9327e18f4acf..b35382f0e820861e6c837f1f4260909e
      # another process may already have an open handle to the same file.
 diff --git a/tests/test_html_chat.py b/tests/test_html_chat.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..75c0c42b1387c6b4b013de6f81fc5f2c237f860b
+index 0000000000000000000000000000000000000000..009b41c928930b1791a471b30e23a21f5c6c45c2
 --- /dev/null
 +++ b/tests/test_html_chat.py
-@@ -0,0 +1,926 @@
+@@ -0,0 +1,988 @@
 +from contextlib import contextmanager, nullcontext
 +import json
 +import os
@@ -3088,6 +3178,7 @@ index 0000000000000000000000000000000000000000..75c0c42b1387c6b4b013de6f81fc5f2c
 +import time
 +import unittest
 +from threading import Event
++from types import SimpleNamespace
 +from unittest.mock import Mock, patch
 +from urllib.error import HTTPError
 +from urllib.request import Request, urlopen
@@ -3102,7 +3193,7 @@ index 0000000000000000000000000000000000000000..75c0c42b1387c6b4b013de6f81fc5f2c
 +from assistant.qwen27_engine import CONTEXT, LlamaSession, REPLY_TOKENS, Qwen27Engine, chat_prompt, generation_settings
 +from assistant.store import Store
 +from scripts.learning.runtime import (ModelPowerRequired, WebModelTask, chat_token_usage, consume_fit_ticket,
-+                                      fit_launch_ticket, gpu_lease, owned_web_process, report_chat_usage,
++                                      fit_launch_ticket, gpu_lease, owned_web_process, report_chat_stage, report_chat_usage,
 +                                      require_web_model, web_model_task)
 +
 +
@@ -3682,6 +3773,67 @@ index 0000000000000000000000000000000000000000..75c0c42b1387c6b4b013de6f81fc5f2c
 +        self.assertEqual(reopened.mode, 'off')
 +        self.assertEqual({item['id']: item['source'] for item in reopened.view(self.sid)['messages']
 +                          if item['role'] == 'assistant'}, {mid: row['source'] for mid, row in rows.items()})
++
++    def test_stage_times_persist_after_completion_cancellation_and_restore(self):
++        app = ChatApp(self.store)
++        later = self.store.new_session()
++        stamp = [100.0]
++        clock = SimpleNamespace(monotonic=lambda: stamp[0])
++        selection = {'runs_on_this_computer': True, 'model': 'Qwen3.8-27B', 'precision': 'BF16',
++                     'revision': 'a' * 40, 'confirmed_batch': False}
++
++        def complete(*args):
++            stamp[0] = 101.0
++            report_chat_stage('chat_loading')
++            stamp[0] = 109.0
++            report_chat_stage('chat_completing')
++            stamp[0] = 113.0
++            return '甲'
++
++        def cancelled(*args):
++            stamp[0] = 201.0
++            report_chat_stage('chat_loading')
++            stamp[0] = 213.0
++            task.force_stop()
++            stamp[0] = 222.0  # Simulate cleanup after the user requested stop.
++            raise EngineError('合成使用者取消', 'cancelled')
++
++        with patch('scripts.learning.runtime.time', clock), patch.object(app.engine, 'describe', return_value=selection):
++            with web_model_task('chat'), patch.object(app.engine, 'answer', side_effect=complete):
++                stamp[0] = 100.1
++                report_chat_stage('chat_context')
++                delivered = app.driver.ask(self.sid, '請用一個字猜這張測試卡的內容。')
++            stamp[0] = 200.0
++            task = WebModelTask('chat')
++            with task.activate(), patch.object(app.engine, 'answer', side_effect=cancelled):
++                stamp[0] = 200.1
++                report_chat_stage('chat_context')
++                with self.assertRaises(EngineError):
++                    app.driver.ask(later, '請用一個字猜另一張測試卡的內容。')
++
++        success = app.view(self.sid)['messages'][-1]['source']['timing']
++        self.assertEqual(success, {'total_ms': 13000, 'stages': [
++            {'stage': 'queued', 'elapsed_ms': 100}, {'stage': 'chat_context', 'elapsed_ms': 900},
++            {'stage': 'chat_loading', 'elapsed_ms': 8000}, {'stage': 'chat_completing', 'elapsed_ms': 4000},
++            {'stage': 'chat_finalizing', 'elapsed_ms': 0},
++        ]})
++        saved = self.store.answer_context(delivered['id'])
++        self.assertNotIn(answer_runs.TIMING_FIELD, ''.join(render_prompt_parts(saved)))
++        retry = app.view(later)['retry']
++        self.assertEqual(retry['status'], 'cancelled')
++        self.assertEqual(retry['source'], '當時選用 Qwen3.8-27B BF16 · 底座')
++        self.assertEqual(retry['timing'], {'total_ms': 13000, 'stages': [
++            {'stage': 'queued', 'elapsed_ms': 100}, {'stage': 'chat_context', 'elapsed_ms': 900},
++            {'stage': 'chat_loading', 'elapsed_ms': 12000},
++        ]})
++        self.assertEqual(len(self.store.messages(later)), 1)
++
++        archive = create_backup(self.store.path)
++        restored_folder = self.store.path.parent / 'restored'
++        restore_backup(archive['path'], restored_folder)
++        reopened = ChatApp(Store(restored_folder / 'assistant.sqlite3'))
++        self.assertEqual(reopened.view(self.sid)['messages'][-1]['source']['timing'], success)
++        self.assertEqual(reopened.view(later)['retry'], retry)
 +
 +    def test_web_prompt_keeps_context_and_uses_the_current_local_product_guidance(self):
 +        self.store.add_message(self.sid, 'assistant', '舊版說明：預設引擎是 Codex。')
